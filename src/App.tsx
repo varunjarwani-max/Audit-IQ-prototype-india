@@ -1,14 +1,14 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { 
   ShieldCheck, 
-  Layers, 
-  FileSpreadsheet, 
-  AlertTriangle, 
-  Info, 
-  CheckCircle2, 
-  RotateCcw,
-  Sparkles,
-  SlidersHorizontal
+  RotateCcw, 
+  Sparkles, 
+  Eye, 
+  SlidersHorizontal,
+  FileSpreadsheet,
+  CheckCircle2,
+  AlertTriangle,
+  FolderOpen
 } from 'lucide-react';
 import { 
   FinancialDataType, 
@@ -26,12 +26,11 @@ import { runFixedAssetDetection, DEFAULT_FIXED_ASSET_THRESHOLDS } from './module
 import { ParsedFileData } from './utils/parser';
 
 import { Sidebar } from './components/Sidebar';
-import { FileUploader } from './components/FileUploader';
-import { SegregationHeader } from './components/SegregationHeader';
-import { ManualConfirmationModal } from './components/ManualConfirmationModal';
-import { BatchViewer } from './components/BatchViewer';
-import { AuditFindings } from './components/AuditFindings';
-import { GroqAuditAdvisor } from './components/GroqAuditAdvisor';
+import { WorkflowStepper, WorkflowStage } from './components/WorkflowStepper';
+import { UploadStage } from './components/UploadStage';
+import { ClassificationStage } from './components/ClassificationStage';
+import { RoutingPipelineStage } from './components/RoutingPipelineStage';
+import { BatchReviewStage } from './components/BatchReviewStage';
 
 const INITIAL_THRESHOLDS: RuleThresholds = {
   transactions: DEFAULT_TRANSACTION_THRESHOLDS,
@@ -52,22 +51,25 @@ export default function App() {
     sessionStorage.setItem('auditiq_groq_api_key', key);
   };
 
-  // 2. Active File / Dataset State (Defaults to 5-record Transaction synthetic test batch)
+  // 2. 4-Stage Workflow State: 'upload' | 'classify' | 'route' | 'review'
+  const [currentStage, setCurrentStage] = useState<WorkflowStage>('review');
+  const [showAllStagesView, setShowAllStagesView] = useState<boolean>(false);
+
+  // 3. Active Dataset / Workpaper State (Defaults to 5-record Transaction test batch)
   const defaultDataset = SAMPLE_DATASETS[0];
   const [activeDatasetId, setActiveDatasetId] = useState<string>(defaultDataset.id);
   const [filename, setFilename] = useState<string>('synthetic_transactions_batch_5.csv');
   const [headers, setHeaders] = useState<string[]>(Object.keys(defaultDataset.data[0]));
   const [records, setRecords] = useState<Record<string, any>[]>(defaultDataset.data);
 
-  // 3. Classification & Routing State
+  // 4. Classification & Routing State
   const [customColumnMap, setCustomColumnMap] = useState<Record<string, string>>({});
   const [manualCategoryOverride, setManualCategoryOverride] = useState<FinancialDataType | null>(null);
-  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
 
-  // 4. Rule Thresholds
+  // 5. Rule Thresholds
   const [thresholds, setThresholds] = useState<RuleThresholds>(INITIAL_THRESHOLDS);
 
-  // 5. 5-Record Batch Testing Slice State
+  // 6. 5-Record Batch Testing Slice State
   const [activeBatchIndex, setActiveBatchIndex] = useState<number>(0);
   const [selectedRowIndex, setSelectedRowIndex] = useState<number | null>(null);
 
@@ -80,7 +82,7 @@ export default function App() {
         detectedType: manualCategoryOverride,
         confidence: 100,
         isAmbiguous: false,
-        reasons: ['User manually confirmed and assigned data category.'],
+        reasons: ['Auditor manually confirmed and bound schema category.'],
         routedModule: manualCategoryOverride === 'transactions'
           ? 'Transaction Anomaly Detection Engine (Approval & Structuring)'
           : manualCategoryOverride === 'ar_ap_aging'
@@ -93,7 +95,7 @@ export default function App() {
     return rawClass;
   }, [headers, manualCategoryOverride]);
 
-  // Combined column map (auto detected + manual overrides)
+  // Combined column map
   const activeColumnMap = useMemo(() => {
     return { ...classification.matchedColumns, ...customColumnMap };
   }, [classification.matchedColumns, customColumnMap]);
@@ -113,7 +115,6 @@ export default function App() {
         return runFixedAssetDetection(records, activeColumnMap, thresholds.fixedAssets);
       case 'ambiguous':
       default:
-        // When ambiguous, produce empty or baseline result
         return {
           moduleName: 'Awaiting User Category Confirmation',
           category: 'ambiguous',
@@ -159,15 +160,9 @@ export default function App() {
     setCustomColumnMap({});
     setActiveBatchIndex(0);
     setSelectedRowIndex(null);
-
-    // If ambiguous, automatically trigger confirmation modal
-    const check = classifyFinancialData(parsed.headers);
-    if (check.isAmbiguous) {
-      setIsManualModalOpen(true);
-    }
   };
 
-  // Update a record inline during iterative testing
+  // Inline Record Update during validation loop
   const handleUpdateRecord = (rowIndex: number, updatedFields: Record<string, any>) => {
     setRecords(prev => {
       const copy = [...prev];
@@ -176,14 +171,14 @@ export default function App() {
     });
   };
 
-  // Reset to clean state
-  const handleReset = () => {
-    handleSelectSample(SAMPLE_DATASETS[0]);
+  const handleManualMappingConfirm = (cat: FinancialDataType, columnMap: Record<string, string>) => {
+    setManualCategoryOverride(cat);
+    setCustomColumnMap(columnMap);
   };
 
   return (
-    <div className="min-h-screen bg-[#F3F4F6] text-slate-900 flex flex-col lg:flex-row antialiased font-sans">
-      {/* Streamlit-Style Sidebar */}
+    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 flex flex-col lg:flex-row antialiased font-sans">
+      {/* Sidebar Navigation & Configurations */}
       <Sidebar
         groqApiKey={groqApiKey}
         onApiKeyChange={handleApiKeyChange}
@@ -197,108 +192,179 @@ export default function App() {
         activeCategory={classification.detectedType}
       />
 
-      {/* Main App Workspace */}
+      {/* Main Forensic Workstation Area */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* Top Minimalist Header */}
-        <header className="h-16 bg-white border-b border-slate-200 px-6 sm:px-8 flex items-center justify-between shrink-0">
+        {/* Top Minimalist Audit Header */}
+        <header className="h-14 bg-white border-b border-slate-200 px-6 flex items-center justify-between shrink-0 shadow-2xs">
           <div className="flex items-center gap-3">
-            <span className="text-xs font-semibold px-2 py-1 bg-green-100 text-green-700 rounded">
-              Active Session
+            <span className="text-[11px] font-mono font-bold px-2 py-0.5 bg-emerald-50 text-emerald-800 border border-emerald-300 rounded">
+              ● Active Workpaper Session
             </span>
-            <span className="text-slate-400 text-xs font-mono truncate max-w-xs">
+            <span className="text-slate-500 text-xs font-mono truncate max-w-xs font-semibold">
               {filename}
             </span>
             <span className="text-slate-300 text-xs hidden sm:inline">•</span>
-            <span className="text-slate-500 text-xs hidden sm:inline">
-              {records.length} records loaded
+            <span className="text-slate-600 text-xs font-mono hidden sm:inline">
+              {records.length} records
+            </span>
+            <span className="text-slate-300 text-xs hidden sm:inline">•</span>
+            <span className="text-xs font-mono text-slate-500 hidden md:inline">
+              Flags: <b className="text-red-600">{auditResult.flaggedCount}</b>
             </span>
           </div>
 
           <div className="flex items-center gap-2">
             <button
-              id="header-clear-btn"
+              id="toggle-all-stages-btn"
               type="button"
-              onClick={handleReset}
-              className="px-3.5 py-1.5 text-xs font-semibold border border-slate-200 rounded hover:bg-slate-50 text-slate-700 transition-colors"
+              onClick={() => setShowAllStagesView(!showAllStagesView)}
+              className={`px-3 py-1.5 text-xs font-semibold border rounded transition-colors flex items-center gap-1.5 ${
+                showAllStagesView
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+              }`}
             >
-              Reset Batch
+              <Eye className="w-3.5 h-3.5" />
+              <span>{showAllStagesView ? 'Single Focused Stage' : 'All Stages View'}</span>
             </button>
+
             <button
-              id="header-override-btn"
+              id="reset-batch-btn"
               type="button"
-              onClick={() => setIsManualModalOpen(true)}
-              className="px-3.5 py-1.5 text-xs font-semibold bg-slate-900 text-white rounded hover:bg-slate-800 transition-colors"
+              onClick={() => handleSelectSample(SAMPLE_DATASETS[0])}
+              className="px-3 py-1.5 text-xs font-semibold border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 rounded transition-colors flex items-center gap-1"
             >
-              Configure Schema
+              <RotateCcw className="w-3.5 h-3.5 text-slate-400" />
+              <span>Reset Batch</span>
             </button>
           </div>
         </header>
 
-        {/* Scrollable Main Area */}
-        <main className="flex-1 p-6 sm:p-8 space-y-6 overflow-y-auto">
-          {/* File Upload Section */}
-          <FileUploader
-            onFileParsed={handleFileParsed}
-            isLoading={false}
-          />
-
-          {/* 3-Card Segregation Status: (a) Detected Schema, (b) Routing Status, (c) Risk Profile */}
-          <SegregationHeader
-            classification={classification}
-            filename={filename}
-            totalRows={records.length}
+        {/* Scrollable Audit Workstation */}
+        <main className="flex-1 p-5 sm:p-7 space-y-6 overflow-y-auto">
+          {/* Horizontal Stepper (Upload → Classify → Route → Review Findings) */}
+          <WorkflowStepper
+            activeStage={currentStage}
+            onSelectStage={setCurrentStage}
+            isAmbiguous={classification.isAmbiguous}
+            confidence={classification.confidence}
+            detectedType={classification.detectedType}
             flaggedCount={auditResult.flaggedCount}
-            onOpenManualOverride={() => setIsManualModalOpen(true)}
-            onReset={handleReset}
+            totalRecords={records.length}
           />
 
-          {/* Testing Workflow: 5-Record Batch Table */}
-          <BatchViewer
-            records={auditResult.records}
-            activeBatchIndex={activeBatchIndex}
-            onBatchChange={setActiveBatchIndex}
-            selectedRowIndex={selectedRowIndex}
-            onSelectRow={setSelectedRowIndex}
-            onUpdateRecord={handleUpdateRecord}
-            category={classification.detectedType}
-          />
+          {/* Workflow Stage Content Rendering */}
+          {showAllStagesView ? (
+            /* All Stages Rendered in Sequence */
+            <div className="space-y-10">
+              <UploadStage
+                onFileParsed={handleFileParsed}
+                onSelectSampleDataset={handleSelectSample}
+                currentFilename={filename}
+                totalRecords={records.length}
+                onAdvanceToClassify={() => setCurrentStage('classify')}
+              />
 
-          {/* Audit Findings: Detailed rule explainability matrix */}
-          <AuditFindings
-            records={auditResult.records}
-            selectedRowIndex={selectedRowIndex}
-            onClearRowSelection={() => setSelectedRowIndex(null)}
-          />
+              <ClassificationStage
+                classification={classification}
+                headers={headers}
+                sampleRows={records.slice(0, 5)}
+                customColumnMap={customColumnMap}
+                onConfirmManualMapping={handleManualMappingConfirm}
+                onAdvanceToRoute={() => setCurrentStage('route')}
+                groqApiKey={groqApiKey}
+                selectedModel={selectedModel}
+              />
 
-          {/* Groq AI Forensic Audit Memo & Advisor */}
-          <GroqAuditAdvisor
-            groqApiKey={groqApiKey}
-            selectedModel={selectedModel}
-            classification={classification}
-            auditResult={auditResult}
-            batchData={records.slice(activeBatchIndex * 5, (activeBatchIndex + 1) * 5)}
-            onOpenApiKeyPrompt={() => {
-              const input = document.getElementById('groq-api-key-input');
-              input?.focus();
-            }}
-          />
+              <RoutingPipelineStage
+                filename={filename}
+                detectedType={classification.detectedType}
+                confidence={classification.confidence}
+                totalRecords={records.length}
+                thresholds={thresholds}
+                onUpdateThresholds={setThresholds}
+                onAdvanceToReview={() => setCurrentStage('review')}
+              />
+
+              <BatchReviewStage
+                records={auditResult.records}
+                activeBatchIndex={activeBatchIndex}
+                onBatchChange={setActiveBatchIndex}
+                selectedRowIndex={selectedRowIndex}
+                onSelectRow={setSelectedRowIndex}
+                onUpdateRecord={handleUpdateRecord}
+                category={classification.detectedType}
+                classification={classification}
+                auditResult={auditResult}
+                groqApiKey={groqApiKey}
+                selectedModel={selectedModel}
+                onOpenApiKeyPrompt={() => {
+                  const input = document.getElementById('groq-api-key-input');
+                  input?.focus();
+                }}
+              />
+            </div>
+          ) : (
+            /* Single Focused Stage View based on activeStage */
+            <div>
+              {currentStage === 'upload' && (
+                <UploadStage
+                  onFileParsed={handleFileParsed}
+                  onSelectSampleDataset={handleSelectSample}
+                  currentFilename={filename}
+                  totalRecords={records.length}
+                  onAdvanceToClassify={() => setCurrentStage('classify')}
+                />
+              )}
+
+              {currentStage === 'classify' && (
+                <ClassificationStage
+                  classification={classification}
+                  headers={headers}
+                  sampleRows={records.slice(0, 5)}
+                  customColumnMap={customColumnMap}
+                  onConfirmManualMapping={handleManualMappingConfirm}
+                  onAdvanceToRoute={() => setCurrentStage('route')}
+                  groqApiKey={groqApiKey}
+                  selectedModel={selectedModel}
+                />
+              )}
+
+              {currentStage === 'route' && (
+                <RoutingPipelineStage
+                  filename={filename}
+                  detectedType={classification.detectedType}
+                  confidence={classification.confidence}
+                  totalRecords={records.length}
+                  thresholds={thresholds}
+                  onUpdateThresholds={setThresholds}
+                  onAdvanceToReview={() => setCurrentStage('review')}
+                />
+              )}
+
+              {currentStage === 'review' && (
+                <BatchReviewStage
+                  records={auditResult.records}
+                  activeBatchIndex={activeBatchIndex}
+                  onBatchChange={setActiveBatchIndex}
+                  selectedRowIndex={selectedRowIndex}
+                  onSelectRow={setSelectedRowIndex}
+                  onUpdateRecord={handleUpdateRecord}
+                  category={classification.detectedType}
+                  classification={classification}
+                  auditResult={auditResult}
+                  groqApiKey={groqApiKey}
+                  selectedModel={selectedModel}
+                  onOpenApiKeyPrompt={() => {
+                    const input = document.getElementById('groq-api-key-input');
+                    input?.focus();
+                  }}
+                />
+              )}
+            </div>
+          )}
         </main>
       </div>
-
-      {/* Manual Classification & Ambiguity Resolution Modal */}
-      <ManualConfirmationModal
-        isOpen={isManualModalOpen}
-        onClose={() => setIsManualModalOpen(false)}
-        classification={classification}
-        headers={headers}
-        sampleRows={records.slice(0, 5)}
-        groqApiKey={groqApiKey}
-        selectedModel={selectedModel}
-        onConfirmCategory={(cat, customMap) => {
-          setManualCategoryOverride(cat);
-          if (customMap) setCustomColumnMap(customMap);
-        }}
-      />
     </div>
   );
 }

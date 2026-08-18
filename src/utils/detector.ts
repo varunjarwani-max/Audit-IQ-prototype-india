@@ -247,3 +247,9 @@ export function classifyFinancialData(headers: string[]): DetectionClassificatio
     routedModule
   };
 }
+
+export function getCategoryFields(category: FinancialDataType): string[] {
+  const sig = SIGNATURES.find(s => s.category === category);
+  return sig ? sig.primaryHeaders : ['date', 'amount', 'vendor', 'account_code', 'approved_by', 'department'];
+}
+

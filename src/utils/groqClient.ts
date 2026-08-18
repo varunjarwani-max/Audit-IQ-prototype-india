@@ -120,6 +120,17 @@ Keep your response crisp, authoritative, and direct (suitable for Chief Audit Ex
   return data.choices?.[0]?.message?.content || 'No memo content returned from Groq.';
 }
 
+export async function suggestColumnMappingWithGroq(
+  apiKey: string,
+  model: string,
+  headers: string[],
+  sampleRows: Record<string, any>[],
+  targetCategory: string
+): Promise<Record<string, string>> {
+  const result = await groqClassifyAmbiguousColumns(apiKey, model, headers, sampleRows);
+  return result.suggestedColumnMapping || {};
+}
+
 export async function groqClassifyAmbiguousColumns(
   apiKey: string,
   model: string,
