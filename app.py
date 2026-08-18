@@ -27,19 +27,38 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Inject Clean Minimalist styling
+# Inject Clean Minimalist styling & enforce dark text across native Streamlit widgets
 st.markdown("""
 <style>
-    /* Background & Clean Typography */
+    /* Global & Native Streamlit Typography / Elements */
+    .stApp, .stApp p, .stApp span, .stApp label, 
+    .stMarkdown, h1, h2, h3, h4, h5, h6,
+    [data-testid="stCaptionContainer"],
+    [data-testid="stSidebar"] *,
+    [data-testid="stWidgetLabel"] label,
+    .stRadio label, .stSelectbox label, .stTextInput label,
+    .stDataFrame, .stTable {
+        color: #0F172A !important;
+    }
+
+    /* Background & Clean Container */
     .stApp {
-        background-color: #F8FAFC;
+        background-color: #F8FAFC !important;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     
     /* Sidebar Styling */
     section[data-testid="stSidebar"] {
-        background-color: #FFFFFF;
-        border-right: 1px solid #E2E8F0;
+        background-color: #FFFFFF !important;
+        border-right: 1px solid #E2E8F0 !important;
+    }
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span {
+        color: #0F172A !important;
     }
     
     /* Metrics / Summary Cards */
@@ -55,18 +74,18 @@ st.markdown("""
         font-size: 11px;
         font-weight: 700;
         text-transform: uppercase;
-        color: #94A3B8;
+        color: #64748B !important;
         letter-spacing: 0.05em;
         margin-bottom: 4px;
     }
     .metric-value {
         font-size: 20px;
         font-weight: 800;
-        color: #0F172A;
+        color: #0F172A !important;
     }
     .metric-subtext {
         font-size: 12px;
-        color: #64748B;
+        color: #64748B !important;
         margin-top: 4px;
     }
     
@@ -80,7 +99,7 @@ st.markdown("""
     }
     .badge-critical {
         background-color: #FEE2E2;
-        color: #991B1B;
+        color: #991B1B !important;
         padding: 2px 8px;
         border-radius: 4px;
         font-size: 10px;
@@ -89,7 +108,7 @@ st.markdown("""
     }
     .badge-high {
         background-color: #FEF3C7;
-        color: #92400E;
+        color: #92400E !important;
         padding: 2px 8px;
         border-radius: 4px;
         font-size: 10px;
@@ -98,7 +117,7 @@ st.markdown("""
     }
     .badge-cleared {
         background-color: #DCFCE7;
-        color: #166534;
+        color: #166534 !important;
         padding: 2px 8px;
         border-radius: 4px;
         font-size: 10px;
