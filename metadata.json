@@ -1,0 +1,6 @@
+{
+  "name": "AuditIQ Data Segregation & Detection",
+  "description": "Financial data classification and anomaly detection layer for AuditIQ, featuring automatic category routing for Transactions, AR/AP Aging, General Ledger, and Fixed Assets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
