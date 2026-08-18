@@ -280,7 +280,7 @@ export const BatchReviewStage: React.FC<BatchReviewStageProps> = ({
 
                 return (
                   <tr
-                    key={record.rowIndex}
+                    key={`batch-row-${record.rowIndex}-${record.recordId}`}
                     onClick={() => onSelectRow(record.rowIndex)}
                     className={`transition-colors cursor-pointer ${
                       isSelected
@@ -317,7 +317,7 @@ export const BatchReviewStage: React.FC<BatchReviewStageProps> = ({
 
                       return (
                         <td
-                          key={col.key}
+                          key={`cell-${record.rowIndex}-${col.key}`}
                           onClick={(e) => startQuickCellEdit(record.rowIndex, col.key, rawVal, e)}
                           className={`py-3 px-4 ${col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'} ${
                             col.isCurrency ? 'font-mono font-semibold text-slate-900' : 'text-slate-800'
@@ -367,9 +367,9 @@ export const BatchReviewStage: React.FC<BatchReviewStageProps> = ({
                     <td className="py-3 px-4 align-middle">
                       {record.flags.length > 0 ? (
                         <div className="flex flex-wrap gap-1.5">
-                          {record.flags.map(f => (
+                          {record.flags.map((f, fIdx) => (
                             <span
-                              key={f.ruleId}
+                              key={`flag-${record.rowIndex}-${f.id || f.ruleCode || fIdx}`}
                               className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border inline-flex items-center gap-1 ${
                                 f.severity === 'CRITICAL'
                                   ? 'bg-red-100 text-red-900 border-red-300'
@@ -379,7 +379,7 @@ export const BatchReviewStage: React.FC<BatchReviewStageProps> = ({
                               }`}
                               title={f.description}
                             >
-                              <span className="font-extrabold">[{f.ruleId}]</span>
+                              <span className="font-extrabold">[{f.ruleCode || f.id}]</span>
                               <span>{f.ruleName}</span>
                             </span>
                           ))}
