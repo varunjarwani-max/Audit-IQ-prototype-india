@@ -97,12 +97,6 @@ if "active_file_name" not in st.session_state: st.session_state["active_file_nam
 with st.sidebar:
     st.markdown("### 🛡️ **AuditIQ**")
     st.caption("Data Segregation & Anomaly Routing Engine")
-    st.divider()
-    
-    st.markdown("#### ⚙️ **Audit Thresholds & Date**")
-    st.session_state["txn_threshold"] = st.number_input("Txn Sign-off Limit (₹ INR)", value=float(st.session_state.get("txn_threshold", 50000.0)), step=5000.0)
-    as_of_date_input = st.text_input("Benchmark As-Of Date", value=st.session_state.get("as_of_date_val", ""), placeholder="e.g. 2024-10-31 (default: auto)")
-    st.session_state["as_of_date_val"] = as_of_date_input.strip() if as_of_date_input else None
 
 # ---------------------------------------------------------
 # Main App Header & Multi-File Ingestion
@@ -127,10 +121,10 @@ if uploaded_files:
             
             col_map = classification["matched_columns"]
             findings = []
-            if category == "transactions": findings = audit_transactions(df, col_map, threshold_limit=st.session_state["txn_threshold"])
-            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=st.session_state.get("as_of_date_val"))
+            if category == "transactions": findings = audit_transactions(df, col_map)
+            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=None)
             elif category == "general_ledger": findings = audit_general_ledger(df, col_map, period_end_days=4)
-            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=st.session_state.get("as_of_date_val"))
+            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=None)
             
             st.session_state["multi_file_data"][file.name] = {
                 "df": df,
