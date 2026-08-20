@@ -111,14 +111,19 @@ def _verify_report_numerics(report_text: str, ground_truths: Dict[str, Any]) -> 
     """
     warnings = []
     
-    # 1. Verify Total Row Count
+    # 1. Verify Grand Total Row Count (Surgical Regex)
     actual_rows = ground_truths.get("total_rows")
     if actual_rows is not None:
-        matches = re.findall(r'(\d[\d,]*)\s*(?:total\s*)?rows', report_text, re.IGNORECASE)
-        for match in matches:
-            claimed_rows = int(match.replace(',', ''))
+        # Look specifically for the mandated phrase, ignoring all other mentions of "rows"
+        total_match = re.search(r'Total Combined Rows:\s*\*?\*?\s*(\d[\d,]*)', report_text, re.IGNORECASE)
+        
+        if total_match:
+            claimed_rows = int(total_match.group(1).replace(',', ''))
             if claimed_rows != actual_rows:
-                warnings.append(f"Sentry Alert: LLM claimed {claimed_rows:,} total rows, but verified data contains exact {actual_rows:,} rows.")
+                warnings.append(f"Sentry Alert: LLM claimed {claimed_rows:,} Total Combined Rows, but verified data contains exact {actual_rows:,} rows.")
+        else:
+            # If the LLM changed the formatting so the regex couldn't find it, flag it.
+            warnings.append("Sentry Alert: LLM failed to explicitly state 'Total Combined Rows' in the required format.")
 
     # 2. Verify Exact JV Imbalances
     for jv_code, expected_diff in ground_truths.get("jv_imbalances", {}).items():
@@ -189,7 +194,7 @@ STRICT NUMERIC CONSTRAINTS (Calculated by Python Engine - DO NOT ALTER OR RECALC
 - Domain Breakdown Data: {json.dumps(domain_breakdown)}
 - Verified Voucher Imbalances (Exact Debit/Credit Differences): {json.dumps(jv_imbalances)}
 
-RULE: You MUST state the exact total row count ({exact_total_rows}) and precise calculated imbalances above. Do NOT compute, estimate, or modify any math figures yourself.
+RULE: You MUST state the exact total row count and precise calculated imbalances above. Do NOT compute, estimate, or modify any math figures yourself.
 
 DOMAIN FINDINGS SUMMARY (Top 10 flags per domain):
 """
@@ -198,13 +203,18 @@ DOMAIN FINDINGS SUMMARY (Top 10 flags per domain):
         flagged_subset = [f for f in data.get("findings", []) if f.get("status") == "FLAGGED"][:10]
         prompt += f"\nFile: {filename}\n{json.dumps(flagged_subset, default=str)}\n"
 
-    prompt += """
+    prompt += f"""
 STRUCTURE:
 # FORENSIC AUDIT EXECUTIVE DOSSIER
+
 ## 1. Executive Summary & Verified Exposure
-(Explicitly state the exact total rows and flags provided in the constraints).
+(You must include these exact two bullet points verbatim):
+- **Total Combined Rows:** {exact_total_rows}
+- **Total Flagged Anomalies:** {exact_flagged_count}
+
 ## 2. Multi-Domain Anomaly Register
 (Detail key findings using the exact computed numbers).
+
 ## 3. Recommended Substantive Audit Procedures
 """
 
