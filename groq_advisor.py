@@ -43,7 +43,6 @@ def generate_consolidated_master_report(all_domain_data: dict):
     """
     client = get_groq_client()
 
-    # Pre-process findings to guarantee exact numeric matching
     summary_stats = []
     formatted_findings = []
 
@@ -63,8 +62,9 @@ def generate_consolidated_master_report(all_domain_data: dict):
         for item in findings:
             if item.get("status") == "FLAGGED":
                 for flag in item.get("flags", []):
-                    # Format amount with strict 2-decimal precision
                     amt = flag.get("amount", 0.0)
+                    threshold = flag.get("threshold")
+                    
                     formatted_findings.append({
                         "domain": domain,
                         "row_index": item.get("row_index"),
@@ -72,14 +72,14 @@ def generate_consolidated_master_report(all_domain_data: dict):
                         "severity": flag.get("severity"),
                         "description": flag.get("description"),
                         "formatted_amount": format_currency(amt) if amt > 0 else "N/A",
+                        "formatted_threshold": format_currency(threshold) if threshold else None,
                         "remediation": flag.get("remediation", "Review supporting documentation.")
                     })
 
-    # Prepare system and user prompts with strict Sentry formatting constraints
     system_prompt = """You are an Executive Forensic Auditor generating an Audit Master Dossier.
 
 CRITICAL SENTRY VERIFICATION CONSTRAINTS:
-1. ALWAYS format every single currency figure with explicit two-decimal places (e.g. '₹60,000.00', NEVER write '₹60,000' or '₹60000').
+1. ALL currency figures AND rule thresholds MUST use explicit two-decimal formatting (e.g. write '₹50,000.00', NEVER write '₹50,000' or '₹50000').
 2. Every monetary figure in Section 1 (Executive Summary) MUST appear with identical decimal string formatting in Section 2 (Anomaly Register).
 3. Do NOT cut off or truncate Markdown tables. Render all table rows completely through completion.
 """
@@ -98,20 +98,19 @@ Structure your output into 3 Sections:
 3. Recommended Substantive Audit Procedures (Numbered action plan).
 """
 
-    # Call Groq API with max_tokens set to 4096 to prevent mid-table cutoff
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        max_tokens=4096,  # Raised ceiling prevents table truncation
+        max_tokens=4096,
         temperature=0.1
     )
 
     report_text = response.choices[0].message.content
 
-    # Post-generation Sentry verification check using the non-backtracking parser
+    # Post-generation verification check using non-backtracking scanner
     unformatted_matches = check_sentry_formatting(report_text)
     sentry_warnings = []
     if unformatted_matches:
