@@ -81,7 +81,6 @@ def generate_consolidated_master_report(all_domain_data: dict, max_retries: int 
     """
     client = get_groq_client()
 
-    # Pre-process findings to guarantee exact numeric matching
     summary_stats = []
     formatted_findings = []
 
@@ -126,8 +125,8 @@ def generate_consolidated_master_report(all_domain_data: dict, max_retries: int 
 CRITICAL SENTRY VERIFICATION CONSTRAINTS:
 1. ALWAYS format every single currency figure with explicit two-decimal places (e.g. '₹60,000.00', NEVER write '₹60,000' or '₹60000').
 2. Every monetary figure in Section 1 (Executive Summary) MUST appear with identical decimal string formatting in Section 2 (Anomaly Register).
-3. NEVER invent, estimate, or state a rule threshold, limit, or benchmark figure (e.g. a vendor billing cap) unless that exact number appears verbatim in the supplied JSON data below. If a rule's description contains no numeric threshold, do not add one — describe the finding qualitatively instead (e.g. "exceeds the applicable vendor billing threshold" with no number).
-4. Do NOT include any internal metadata columns (e.g. debug tokens, ground-truth tokens, QA fields, "GT Token") in the output tables — only the columns explicitly requested in the structure below.
+3. NEVER invent, estimate, or state a rule threshold, limit, or benchmark figure (e.g. a vendor billing cap) unless that exact number appears verbatim in the supplied JSON data below. If a rule's description contains no numeric threshold, do not add one - describe the finding qualitatively instead (e.g. "exceeds the applicable vendor billing threshold" with no number).
+4. Do NOT include any internal metadata columns (e.g. debug tokens, ground-truth tokens, QA fields, "GT Token", "[[GT_n]]") in the output tables - only the columns explicitly requested in the structure below.
 5. Do NOT cut off or truncate Markdown tables. Render all table rows completely through completion.
 6. Every currency figure you write MUST be copied character-for-character from a "formatted_amount", "formatted_debit", "formatted_credit", "formatted_book_value", or "formatted_cost" value in the JSON below. Do not compute, round, or restate a number from memory.
 """
@@ -142,7 +141,7 @@ Flagged Anomalies Detail:
 
 Structure your output into 3 Sections:
 1. Executive Summary & Verified Exposure (Include combined counts, file metrics table, and exact exposure bullets with 2 decimals).
-2. Multi-Domain Anomaly Register (Render Markdown tables categorized by domain: Fixed Assets, General Ledger, Accounts Receivable / Accounts Payable Aging, and Transactions. Columns: Row, Rule, Severity, Finding, Detected Value, Remediation — no other columns).
+2. Multi-Domain Anomaly Register (Render Markdown tables categorized by domain: Fixed Assets, General Ledger, Accounts Receivable / Accounts Payable Aging, and Transactions. Columns: Row, Rule, Severity, Finding, Detected Value, Remediation - no other columns).
 3. Recommended Substantive Audit Procedures (Numbered action plan).
 """
 
@@ -177,10 +176,35 @@ Structure your output into 3 Sections:
         if integrity_issues:
             sentry_warnings.append(f"Sentry integrity check failed: {integrity_issues}")
 
-        # Clean pass: stop retrying
         if not integrity_issues and finish_reason != "length":
             break
 
         attempt += 1
 
     return report_text, sentry_warnings
+
+
+def generate_executive_memo(domain_name: str, findings: list):
+    """Generates domain-level executive summary memo."""
+    client = get_groq_client()
+    prompt = f"Provide a executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024,
+        temperature=0.2
+    )
+    return response.choices[0].message.content
+
+
+def generate_5c_finding_memo(record_data: dict, domain_name: str):
+    """Generates 5C audit memo (Condition, Criteria, Cause, Effect, Recommendation)."""
+    client = get_groq_client()
+    prompt = f"Generate a 5C audit note for row #{record_data['row_index']} in {domain_name}. Data: {json.dumps(record_data)}"
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024,
+        temperature=0.2
+    )
+    return response.choices[0].message.content
