@@ -1,5 +1,4 @@
 """
-groq_advisor.py
 Groq LLM Client & 5C Audit Workpaper Generator for AuditIQ.
 
 Architecture Note (Privacy & Deployment):
@@ -228,3 +227,63 @@ STRUCTURE:
     ]
 
     return _call_groq_with_retry(api_key, model, messages, max_tokens=600, temperature=0.1)
+
+
+def generate_consolidated_master_report(
+    api_key: str,
+    model: str,
+    all_domain_data: Dict[str, Any]
+) -> str:
+    """
+    Synthesizes findings across multiple datasets (Transactions, GL, AR/AP, Fixed Assets) 
+    into a single partner-level executive dossier.
+    """
+    if not api_key or not api_key.strip():
+        raise ValueError("Groq API key is missing. Please enter your key in the sidebar.")
+
+    master_summary = []
+    
+    for filename, data in all_domain_data.items():
+        flagged_items = [f for f in data.get("findings", []) if f.get("status") == "FLAGGED"]
+        
+        domain_block = {
+            "file": filename,
+            "domain": data.get("category", "Unknown"),
+            "total_rows_evaluated": len(data.get("df", [])),
+            "flagged_count": len(flagged_items),
+            "critical_flags": []
+        }
+        
+        # Pull top 10 most critical flags per domain to avoid token overflow
+        for item in flagged_items[:10]:
+            domain_block["critical_flags"].append({
+                "row": item.get("row_index"),
+                "flags": item.get("flags")
+            })
+            
+        master_summary.append(domain_block)
+        
+    prompt = f"""
+You are an elite Senior Audit Partner at a Big 4 accounting firm.
+Review the following cross-domain anomaly telemetry extracted by the AuditIQ deterministic engine.
+
+DATA INGESTED:
+{json.dumps(master_summary, indent=2)}
+
+Draft a formal, partner-level 'Executive Roll-Up Memo'.
+Structure the response exactly as follows:
+1. Executive Summary & Exposure Overview
+2. Multi-Domain Anomaly Register (Summarize the worst findings across domains)
+3. Control Environment Assessment
+4. Recommended Substantive Audit Procedures
+
+Maintain a strictly professional, objective, and authoritative forensic accounting tone.
+"""
+
+    messages = [
+        {"role": "system", "content": "You are a licensed Chartered Accountant and Forensic Auditor."},
+        {"role": "user", "content": prompt}
+    ]
+
+    # Leverages existing _call_groq_with_retry for rate limits and connection issues
+    return _call_groq_with_retry(api_key, model, messages, max_tokens=2000, temperature=0.2)
