@@ -2,6 +2,7 @@
 detector.py
 Data Segregation & Column Alias Signature Classifier for AuditIQ.
 Enforces strict word-boundary token matching to prevent false positives (e.g. 'dr' in 'address').
+Synchronized scoring logic with TypeScript (85/15 primary/secondary weighted ratios + category penalty floors).
 """
 
 import re
@@ -12,6 +13,7 @@ ALIAS_DEFINITIONS = {
         "display_name": "Transactions Data",
         "module_file": "txn_detection.py",
         "primary_fields": ["date", "amount", "vendor", "account_code", "approved_by", "department"],
+        "secondary_fields": ["transaction_id", "description", "payment_method", "currency", "receipt_attached"],
         "aliases": {
             "date": ["date", "txn_date", "transaction_date", "trans_date", "spend_date", "posting_date", "timestamp"],
             "amount": ["amount", "txn_amount", "total_amount", "cost", "spend", "amount_inr", "amount_usd", "subtotal", "val_num", "charge"],
@@ -25,6 +27,7 @@ ALIAS_DEFINITIONS = {
         "display_name": "AR / AP Aging Ledger",
         "module_file": "aging_detection.py",
         "primary_fields": ["invoice_date", "due_date", "payment_date", "amount", "customer_vendor", "invoice_status"],
+        "secondary_fields": ["invoice_number", "terms", "aging_bucket", "days_overdue", "currency", "discount"],
         "aliases": {
             "invoice_date": ["invoice_date", "inv_date", "bill_date", "doc_date", "issue_date", "origination_date"],
             "due_date": ["due_date", "maturity_date", "payment_due", "due", "expiry_date", "expected_date"],
@@ -38,6 +41,7 @@ ALIAS_DEFINITIONS = {
         "display_name": "General Ledger (GL) Entries",
         "module_file": "gl_detection.py",
         "primary_fields": ["entry_date", "account_name", "debit", "credit", "journal_reference", "prepared_by"],
+        "secondary_fields": ["line_number", "description", "entity_id", "currency", "is_manual", "posted_time"],
         "aliases": {
             "entry_date": ["entry_date", "posting_date", "je_date", "effective_date", "txn_timestamp", "journal_date"],
             "account_name": ["account_name", "account_description", "gl_account", "account_title", "account", "ledger_account"],
@@ -51,6 +55,7 @@ ALIAS_DEFINITIONS = {
         "display_name": "Fixed Asset Register",
         "module_file": "fixed_asset_detection.py",
         "primary_fields": ["asset_name", "purchase_date", "purchase_cost", "depreciation_method", "useful_life", "current_value"],
+        "secondary_fields": ["asset_id", "asset_tag", "serial_number", "accumulated_depreciation", "salvage_value", "location"],
         "aliases": {
             "asset_name": ["asset_name", "asset_description", "equipment_name", "asset_title", "item_name", "asset"],
             "purchase_date": ["purchase_date", "acquisition_date", "capitalization_date", "placed_in_service", "buy_date", "in_service_date"],
@@ -90,7 +95,7 @@ def alias_matches_column(alias: str, norm_col: str) -> bool:
     if len(alias) <= 3:
         return alias in tokens
 
-    # For longer aliases, match whole token or anchored compound match
+    # For longer aliases, match whole token
     if alias in tokens:
         return True
     
@@ -105,8 +110,19 @@ def alias_matches_column(alias: str, norm_col: str) -> bool:
 def classify_columns(columns: List[str]) -> Dict[str, Any]:
     """
     Analyzes list of columns against alias dictionaries using token-boundary matching.
-    Returns detected category, confidence percentage, matched field mappings, and routing metadata.
+    Applies weighted scoring (85% primary + 15% secondary) with penalty floors.
     """
+    if not columns:
+        return {
+            "category": "ambiguous",
+            "raw_best_category": "transactions",
+            "confidence": 0,
+            "is_ambiguous": True,
+            "matched_columns": {},
+            "all_scores": {cat: 0 for cat in ALIAS_DEFINITIONS},
+            "schema_details": ALIAS_DEFINITIONS["transactions"]
+        }
+
     normalized_cols = {col: normalize_string(col) for col in columns}
     scores = {}
     mappings = {}
@@ -114,9 +130,10 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
     for cat, schema in ALIAS_DEFINITIONS.items():
         matched_fields = {}
         primary_fields = schema["primary_fields"]
+        secondary_fields = schema.get("secondary_fields", [])
         aliases = schema["aliases"]
 
-        matched_count = 0
+        matched_primary_count = 0
         for std_field in primary_fields:
             field_aliases = [normalize_string(a) for a in aliases.get(std_field, [std_field])]
             
@@ -124,11 +141,38 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
             for orig_col, norm_col in normalized_cols.items():
                 if any(alias_matches_column(alias, norm_col) for alias in field_aliases):
                     matched_fields[std_field] = orig_col
-                    matched_count += 1
+                    matched_primary_count += 1
                     break
         
-        confidence = round((matched_count / len(primary_fields)) * 100, 1)
-        scores[cat] = confidence
+        # Check secondary headers
+        matched_sec_count = 0
+        for sec_field in secondary_fields:
+            norm_sec = normalize_string(sec_field)
+            for orig_col, norm_col in normalized_cols.items():
+                if alias_matches_column(norm_sec, norm_col) and orig_col not in matched_fields.values():
+                    matched_sec_count += 1
+                    break
+
+        primary_ratio = matched_primary_count / len(primary_fields)
+        secondary_ratio = min(1.0, matched_sec_count / 2.0) if secondary_fields else 0.0
+
+        score = round((primary_ratio * 85.0) + (secondary_ratio * 15.0), 1)
+
+        # Domain critical penalty floors
+        if cat == "general_ledger":
+            has_dr_cr = ("debit" in matched_fields) or ("credit" in matched_fields)
+            if not has_dr_cr:
+                score = min(score, 30.0)
+        elif cat == "fixed_assets":
+            has_asset_cost = ("asset_name" in matched_fields) or ("purchase_cost" in matched_fields)
+            if not has_asset_cost:
+                score = min(score, 30.0)
+        elif cat == "ar_ap_aging":
+            has_due_status = ("due_date" in matched_fields) or ("invoice_status" in matched_fields)
+            if not has_due_status:
+                score = min(score, 30.0)
+
+        scores[cat] = score
         mappings[cat] = matched_fields
 
     best_category = max(scores, key=scores.get)

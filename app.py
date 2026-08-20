@@ -9,12 +9,13 @@ Run locally with:
 import streamlit as st
 import pandas as pd
 import numpy as np
+import time
 from datetime import datetime
 
 # Local helper modules
 from detector import classify_columns, ALIAS_DEFINITIONS
 from rules_engine import audit_transactions, audit_aging, audit_general_ledger, audit_fixed_assets
-from groq_advisor import SUPPORTED_MODELS, test_groq_key, generate_executive_memo
+from groq_advisor import SUPPORTED_MODELS, test_groq_key, generate_executive_memo, generate_5c_finding_memo
 from sample_data import SAMPLE_DATASETS
 
 # ---------------------------------------------------------
@@ -149,6 +150,8 @@ if "custom_col_map" not in st.session_state:
     st.session_state["custom_col_map"] = {}
 if "txn_threshold" not in st.session_state:
     st.session_state["txn_threshold"] = 50000.0
+if "individual_memos" not in st.session_state:
+    st.session_state["individual_memos"] = {}
 
 
 # ---------------------------------------------------------
@@ -166,7 +169,7 @@ with st.sidebar:
         value=st.session_state["groq_api_key"],
         type="password",
         placeholder="gsk_...",
-        help="Session stored. Used for connection tests and AI workpaper memos."
+        help="Session stored. Used for connection tests and 5C AI workpaper notes."
     )
     if api_key_input != st.session_state["groq_api_key"]:
         st.session_state["groq_api_key"] = api_key_input
@@ -179,55 +182,50 @@ with st.sidebar:
     selected_model = st.selectbox(
         "Inference Model",
         options=model_options,
-        format_func=lambda x: model_labels.get(x, x),
-        index=0
+        format_func=lambda x: model_labels[x],
+        index=model_options.index(st.session_state["selected_model"])
     )
     st.session_state["selected_model"] = selected_model
 
     # Connection Test Button
-    if st.button("⚡ Test Connection", use_container_width=True):
-        if not st.session_state["groq_api_key"]:
-            st.error("Please enter a Groq API key first.")
-        else:
-            with st.spinner("Testing Groq API connection..."):
-                res = test_groq_key(st.session_state["groq_api_key"], model=selected_model)
-                if res["success"]:
-                    st.success(res["message"])
-                    st.session_state["connection_tested"] = True
-                else:
-                    st.error(res["message"])
-                    st.session_state["connection_tested"] = False
+    test_btn = st.button("⚡ Test Groq Connection", use_container_width=True)
+    if test_btn:
+        with st.spinner("Connecting to Groq endpoint..."):
+            res = test_groq_key(st.session_state["groq_api_key"], selected_model)
+            if res["success"]:
+                st.session_state["connection_tested"] = True
+                st.success(res["message"])
+            else:
+                st.session_state["connection_tested"] = False
+                st.error(res["message"])
 
     st.divider()
 
-    # Pre-Loaded Synthetic Test Batches
-    st.markdown("#### 📂 **Pre-loaded Test Batches**")
-    st.caption("Select a 5-record slice to evaluate segregation & anomaly rules:")
+    # Synthetic Dataset Picker
+    st.markdown("#### 🧪 **Synthetic Datasets**")
+    dataset_keys = list(SAMPLE_DATASETS.keys())
     
-    sample_choice = st.radio(
-        "Select Domain Batch:",
-        options=list(SAMPLE_DATASETS.keys()),
-        format_func=lambda k: SAMPLE_DATASETS[k]["name"],
-        index=list(SAMPLE_DATASETS.keys()).index(st.session_state["current_dataset_key"])
-    )
-
-    if sample_choice != st.session_state["current_dataset_key"]:
-        st.session_state["current_dataset_key"] = sample_choice
-        st.session_state["working_df"] = SAMPLE_DATASETS[sample_choice]["df"].copy()
-        st.session_state["batch_index"] = 0
-        st.session_state["override_category"] = None
-        st.session_state["custom_col_map"] = {}
-        st.rerun()
+    for k in dataset_keys:
+        d = SAMPLE_DATASETS[k]
+        is_active = (st.session_state["current_dataset_key"] == k)
+        btn_label = f"{'🟢' if is_active else '📄'} {d['title']}"
+        
+        if st.button(btn_label, key=f"btn_sample_{k}", use_container_width=True):
+            st.session_state["current_dataset_key"] = k
+            st.session_state["working_df"] = d["df"].copy()
+            st.session_state["batch_index"] = 0
+            st.session_state["override_category"] = None
+            st.session_state["custom_col_map"] = {}
+            st.session_state["individual_memos"] = {}
+            st.rerun()
 
     st.divider()
-
-    # Rule Parameters Slider
-    st.markdown("#### ⚙️ **Audit Rule Thresholds**")
-    st.session_state["txn_threshold"] = st.slider(
-        "Transaction Approval Ceiling (₹)",
-        min_value=10000.0,
-        max_value=100000.0,
-        value=50000.0,
+    st.markdown("#### ⚙️ **Audit Thresholds**")
+    st.session_state["txn_threshold"] = st.number_input(
+        "Txn Sign-off Limit (₹ INR)",
+        min_value=1000.0,
+        max_value=10000000.0,
+        value=float(st.session_state.get("txn_threshold", 50000.0)),
         step=5000.0
     )
 
@@ -257,6 +255,7 @@ if uploaded_file is not None:
             st.session_state["batch_index"] = 0
             st.session_state["override_category"] = None
             st.session_state["custom_col_map"] = {}
+            st.session_state["individual_memos"] = {}
             st.success(f"Successfully loaded {uploaded_file.name} ({len(uploaded_df)} rows)")
     except Exception as e:
         st.error(f"Error parsing uploaded file: {str(e)}")
@@ -327,34 +326,45 @@ if is_ambiguous:
 
 
 # ---------------------------------------------------------
-# 3-Card Minimalist Summary Grid
+# Full-Dataset Vectorized Anomaly Detection (Crucial for Global Multi-Row Rules)
 # ---------------------------------------------------------
 module_script_name = ALIAS_DEFINITIONS[active_category]["module_file"]
 category_title = ALIAS_DEFINITIONS[active_category]["display_name"]
 
-# 5-Record Batching Slice
-BATCH_SIZE = 5
+t_start = time.perf_counter()
+
+if active_category == "transactions":
+    all_findings = audit_transactions(current_df, effective_col_map, threshold_limit=st.session_state["txn_threshold"])
+elif active_category == "ar_ap_aging":
+    all_findings = audit_aging(current_df, effective_col_map, severe_overdue_days=90)
+elif active_category == "general_ledger":
+    all_findings = audit_general_ledger(current_df, effective_col_map, period_end_days=4)
+elif active_category == "fixed_assets":
+    all_findings = audit_fixed_assets(current_df, effective_col_map)
+else:
+    all_findings = []
+
+t_eval_ms = (time.perf_counter() - t_start) * 1000.0
+
 total_records = len(current_df)
+total_flagged_all = sum(1 for f in all_findings if f["status"] == "FLAGGED")
+
+# 5-Record Batching Slice for Visual Inspection
+BATCH_SIZE = 5
 total_batches = max(1, (total_records + BATCH_SIZE - 1) // BATCH_SIZE)
 current_batch_idx = min(st.session_state["batch_index"], total_batches - 1)
 
-batch_df = current_df.iloc[current_batch_idx * BATCH_SIZE : (current_batch_idx + 1) * BATCH_SIZE].copy()
+batch_start_idx = current_batch_idx * BATCH_SIZE
+batch_end_idx = min((current_batch_idx + 1) * BATCH_SIZE, total_records)
 
-# Execute Vectorized Anomaly Detection for Current Batch
-if active_category == "transactions":
-    findings = audit_transactions(batch_df, effective_col_map, threshold_limit=st.session_state["txn_threshold"])
-elif active_category == "ar_ap_aging":
-    findings = audit_aging(batch_df, effective_col_map, severe_overdue_days=90)
-elif active_category == "general_ledger":
-    findings = audit_general_ledger(batch_df, effective_col_map, period_end_days=4)
-elif active_category == "fixed_assets":
-    findings = audit_fixed_assets(batch_df, effective_col_map)
-else:
-    findings = []
+batch_df = current_df.iloc[batch_start_idx:batch_end_idx].copy()
+batch_findings = all_findings[batch_start_idx:batch_end_idx]
+batch_flagged_count = sum(1 for f in batch_findings if f["status"] == "FLAGGED")
 
-flagged_count = sum(1 for f in findings if f["status"] == "FLAGGED")
 
-# Render 3 Summary Metric Cards
+# ---------------------------------------------------------
+# 3-Card Minimalist Summary Grid
+# ---------------------------------------------------------
 m_col1, m_col2, m_col3 = st.columns(3)
 
 with m_col1:
@@ -362,26 +372,26 @@ with m_col1:
     <div class="metric-card">
         <div class="metric-label">Detected Schema</div>
         <div class="metric-value" style="color: #2563EB;">{category_title}</div>
-        <div class="metric-subtext">Confidence Score: <b>{confidence}%</b></div>
+        <div class="metric-subtext">Signature Confidence: <b>{confidence}%</b></div>
     </div>
     """, unsafe_allow_html=True)
 
 with m_col2:
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">Routing Status</div>
+        <div class="metric-label">Vectorized Engine Execution</div>
         <div class="metric-value" style="font-family: monospace;">{module_script_name}</div>
-        <div class="metric-subtext">Vectorized Pandas Rule Engine</div>
+        <div class="metric-subtext">Evaluated <b>{total_records:,}</b> records in <b>{t_eval_ms:.1f}ms</b></div>
     </div>
     """, unsafe_allow_html=True)
 
 with m_col3:
-    risk_color = "#EF4444" if flagged_count > 0 else "#10B981"
+    risk_color = "#EF4444" if total_flagged_all > 0 else "#10B981"
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">Risk Profile</div>
-        <div class="metric-value" style="color: {risk_color};">{flagged_count} Flags Raised</div>
-        <div class="metric-subtext">Out of <b>{len(batch_df)}</b> records in current batch</div>
+        <div class="metric-label">Full File Risk Profile</div>
+        <div class="metric-value" style="color: {risk_color};">{total_flagged_all} Flagged Anomalies</div>
+        <div class="metric-subtext">Across entire <b>{total_records:,}</b> row ledger ({batch_flagged_count} in current view)</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -390,7 +400,7 @@ with m_col3:
 # Interactive 5-Record Batch Editor (st.data_editor)
 # ---------------------------------------------------------
 st.markdown("### 📊 Live Batch Preview & Interactive Test Editor")
-st.caption(f"Showing slice records `{current_batch_idx * BATCH_SIZE + 1}` to `{min((current_batch_idx + 1) * BATCH_SIZE, total_records)}` of `{total_records}` total. You can edit cells inline below to immediately test rule sensitivities:")
+st.caption(f"Showing slice records `{batch_start_idx + 1}` to `{batch_end_idx}` of `{total_records}` total. You can edit cells inline below to immediately test live rule re-evaluation:")
 
 # Render editable table
 edited_batch_df = st.data_editor(
@@ -402,7 +412,7 @@ edited_batch_df = st.data_editor(
 
 # Update session working_df if modified
 if not edited_batch_df.equals(batch_df):
-    st.session_state["working_df"].iloc[current_batch_idx * BATCH_SIZE : (current_batch_idx + 1) * BATCH_SIZE] = edited_batch_df
+    st.session_state["working_df"].iloc[batch_start_idx:batch_end_idx] = edited_batch_df
     st.rerun()
 
 # Batch Pagination Controls
@@ -429,17 +439,17 @@ st.divider()
 st.markdown("### 🔍 Itemized Audit Findings")
 st.caption("Root-cause breakdown and SOX internal audit remediation guidelines for the active batch slice:")
 
-if flagged_count == 0:
-    st.success("✅ **Batch Cleared**: No compliance violations or transaction anomalies detected across active parameters.")
+if batch_flagged_count == 0:
+    st.success("✅ **Batch Slice Cleared**: No compliance violations or transaction anomalies detected in this 5-record window.")
 else:
-    for item in findings:
-        row_num = item["row_index"]
+    for item in batch_findings:
+        global_row_num = item["row_index"]
         status = item["status"]
         flags = item["flags"]
         
         if status == "FLAGGED":
             with st.container():
-                st.markdown(f"#### 🚩 Record #{row_num} (Row Index: {current_batch_idx * BATCH_SIZE + row_num})")
+                st.markdown(f"#### 🚩 Record #{global_row_num} (Row Index: {global_row_num})")
                 for f in flags:
                     sev = f["severity"]
                     badge_class = "badge-critical" if sev == "CRITICAL" else "badge-high"
@@ -467,21 +477,50 @@ else:
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
+                
+                # Single-Record 5C Memo Generation Button
+                memo_key = f"memo_row_{global_row_num}"
+                if memo_key in st.session_state["individual_memos"]:
+                    st.markdown("##### 📝 Individual 5C Finding Workpaper Note")
+                    st.markdown(st.session_state["individual_memos"][memo_key])
+                else:
+                    if st.button(f"Generate 5C Note for Row #{global_row_num}", key=f"btn_5c_{global_row_num}"):
+                        if not st.session_state["groq_api_key"]:
+                            st.error("Please provide a Groq API Key in the sidebar.")
+                        else:
+                            with st.spinner(f"Drafting 5C Note for Row #{global_row_num}..."):
+                                try:
+                                    raw_record_dict = current_df.iloc[global_row_num - 1].to_dict()
+                                    record_payload = {
+                                        "row_index": global_row_num,
+                                        "data": raw_record_dict,
+                                        "flags": flags
+                                    }
+                                    note = generate_5c_finding_memo(
+                                        api_key=st.session_state["groq_api_key"],
+                                        model=selected_model,
+                                        record=record_payload,
+                                        category=category_title
+                                    )
+                                    st.session_state["individual_memos"][memo_key] = note
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to generate 5C note: {str(e)}")
 
 
 # ---------------------------------------------------------
-# Groq AI Audit Advisor Memo Generator
+# Groq AI Audit Advisor Batch Executive Memo Generator
 # ---------------------------------------------------------
 st.divider()
-st.markdown("### 🤖 Groq AI Forensic Audit Advisor")
-st.caption("Generate an executive workpaper memo summarizing risk exposures and internal control actions:")
+st.markdown("### 🤖 Groq AI Forensic Audit Advisor (Executive Batch Workpaper)")
+st.caption("Generate a formal 5C executive workpaper memo summarizing risk exposures and management actions for the active batch:")
 
 ai_col1, ai_col2 = st.columns([3, 1])
 with ai_col1:
     st.info(f"Active Model: **{selected_model}** | Key Status: {'✅ Configured' if st.session_state['groq_api_key'] else '❌ Missing API Key'}")
 
 with ai_col2:
-    generate_btn = st.button("✨ Generate Audit Memo", type="primary", use_container_width=True)
+    generate_btn = st.button("✨ Generate Batch Memo", type="primary", use_container_width=True)
 
 if generate_btn:
     if not st.session_state["groq_api_key"]:
@@ -493,7 +532,7 @@ if generate_btn:
                     api_key=st.session_state["groq_api_key"],
                     model=selected_model,
                     category=category_title,
-                    findings=findings,
+                    findings=batch_findings,
                     batch_df_records=batch_df.to_dict(orient="records"),
                     confidence=confidence
                 )
