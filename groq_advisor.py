@@ -22,14 +22,17 @@ except ImportError:
     import urllib.request
     import urllib.error
 
-# Load from Streamlit secrets, defaulting to placeholders if not set in secrets.toml
-GROQ_API_KEYS = [
-    st.secrets.get("GROQ_API_KEY_1", "GROQ_API_KEY_1_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_2", "GROQ_API_KEY_2_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_3", "GROQ_API_KEY_3_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_4", "GROQ_API_KEY_4_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_5", "GROQ_API_KEY_5_PLACEHOLDER")
-]
+
+def _get_groq_api_keys() -> List[str]:
+    """Safely retrieves API keys from st.secrets at runtime to prevent top-level import crashes."""
+    keys = []
+    for i in range(1, 6):
+        try:
+            key = st.secrets.get(f"GROQ_API_KEY_{i}", f"GROQ_API_KEY_{i}_PLACEHOLDER")
+        except Exception:
+            key = f"GROQ_API_KEY_{i}_PLACEHOLDER"
+        keys.append(key)
+    return keys
 
 
 def _call_groq_with_retry(
@@ -45,10 +48,11 @@ def _call_groq_with_retry(
     Tries the next key immediately on 429 rate limit. If all 5 keys fail, it backs off 
     exponentially before retrying the pool. Falls back to 8B model if 20B fails completely.
     """
+    api_keys = _get_groq_api_keys()
     last_exception = None
 
     for round_num in range(max_backoff_rounds):
-        for api_key in GROQ_API_KEYS:
+        for api_key in api_keys:
             cleaned_key = api_key.strip()
             if not cleaned_key or cleaned_key.endswith("_PLACEHOLDER"):
                 continue
@@ -85,28 +89,24 @@ def _call_groq_with_retry(
                 err_str = str(e).lower()
                 last_exception = e
                 
-                # If rate-limited or timeout, immediately continue to the next key in the loop
                 if "429" in err_str or "rate limit" in err_str or "tpm" in err_str or "rpm" in err_str:
                     continue
                 elif "timeout" in err_str or "connection" in err_str:
                     continue
                 else:
-                    # For bad requests/other errors, still try next key just in case it's a key-specific issue
                     continue
 
-        # If we reach here, ALL valid keys failed in this round. Apply exponential backoff before the next round.
         if round_num < max_backoff_rounds - 1:
             sleep_time = (2 ** (round_num + 1)) + random.uniform(0.5, 1.5)
             time.sleep(sleep_time)
 
-    # Fallback Logic: If the 20B target exhausts all keys and backoff rounds, drop to the 8B fallback.
     if allow_fallback and model == "openai/gpt-oss-20b":
         return _call_groq_with_retry(
             messages=messages,
             model="llama-3.1-8b-instant",
             max_tokens=max_tokens,
             temperature=temperature,
-            max_backoff_rounds=1, # Shorter retry loops for the fallback
+            max_backoff_rounds=1,
             allow_fallback=False
         )
 
@@ -119,9 +119,7 @@ def generate_executive_memo(
     batch_df_records: List[Dict[str, Any]],
     confidence: float
 ) -> str:
-    """
-    Generates a formal 5C Internal Audit Workpaper Memo across the batch findings.
-    """
+    """Generates a formal 5C Internal Audit Workpaper Memo across the batch findings."""
     flagged_records = [f for f in findings if f.get("status") == "FLAGGED"]
 
     concise_findings = []
@@ -191,9 +189,7 @@ def generate_5c_finding_memo(
     record: Dict[str, Any],
     category: str
 ) -> str:
-    """
-    Generates a dedicated, single-record 5C workpaper memo for an individual flagged transaction.
-    """
+    """Generates a dedicated, single-record 5C workpaper memo for an individual flagged transaction."""
     prompt = f"""
 Draft a concise 5C Workpaper Note for this individual flagged record in the {category} module:
 
@@ -219,10 +215,7 @@ STRUCTURE:
 def generate_consolidated_master_report(
     all_domain_data: Dict[str, Any]
 ) -> str:
-    """
-    Synthesizes findings across multiple datasets (Transactions, GL, AR/AP, Fixed Assets) 
-    into a single partner-level executive dossier.
-    """
+    """Synthesizes findings across multiple datasets into a single partner-level executive dossier."""
     master_summary = []
     
     for filename, data in all_domain_data.items():
@@ -236,7 +229,6 @@ def generate_consolidated_master_report(
             "critical_flags": []
         }
         
-        # Pull top 10 most critical flags per domain to avoid token overflow
         for item in flagged_items[:10]:
             domain_block["critical_flags"].append({
                 "row": item.get("row_index"),
