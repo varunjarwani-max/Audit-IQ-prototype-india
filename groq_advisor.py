@@ -67,7 +67,6 @@ def _is_flagged_finding(f: Dict[str, Any]) -> bool:
     if not isinstance(f, dict):
         return False
     status = f.get("status")
-    # If no explicit status key exists, assume findings in list are flagged anomalies
     if status is None:
         return True
     return str(status).upper() in ("FLAGGED", "TRUE", "HIGH", "CRITICAL", "YES", "ANOMALY")
@@ -77,12 +76,10 @@ def _clean_and_preserve_finding(f: Dict[str, Any]) -> Dict[str, Any]:
     """Extracts finding details dynamically while truncating text to optimize token usage."""
     cleaned = {}
 
-    # 1. Extract Rule ID or Category
     cleaned["rule"] = (
         f.get("rule_id") or f.get("rule_code") or f.get("rule") or f.get("category") or "ANOMALY"
     )
 
-    # 2. Extract Finding Description (checks all standard schema keys)
     description = (
         f.get("finding") or
         f.get("description") or
@@ -94,7 +91,6 @@ def _clean_and_preserve_finding(f: Dict[str, Any]) -> Dict[str, Any]:
     )
     cleaned["finding"] = str(description)[:200] if description else "Flagged anomaly detected."
 
-    # 3. Preserve critical forensic identifiers if present
     for identifier in ["row", "row_index", "voucher_no", "vendor", "vendor_name", "account", "severity", "amount"]:
         if identifier in f and f[identifier] is not None:
             cleaned[identifier] = f[identifier]
@@ -167,7 +163,6 @@ def _call_groq_with_retry(
         if round_num < max_backoff_rounds - 1:
             time.sleep((2 ** (round_num + 1)) + random.uniform(0.5, 1.5))
 
-    # Fall back to an active Groq model if primary fails
     if allow_fallback and model == "openai/gpt-oss-20b":
         logger.warning("Primary model exhausted retries, falling back to llama-3.3-70b-versatile.")
         return _call_groq_with_retry(
@@ -272,7 +267,7 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
     tokenized_domain_findings = []
     for filename, data in all_domain_data.items():
         findings = data.get("findings", [])
-        flagged_raw = [f for f in findings if _is_flagged_finding(f)][:5]  # Top 5 detailed findings per domain
+        flagged_raw = [f for f in findings if _is_flagged_finding(f)][:5]
         
         cleaned_subset = [_clean_and_preserve_finding(f) for f in flagged_raw]
         tokenized_subset = _tokenize_currency(cleaned_subset, token_registry, value_to_token)
@@ -311,7 +306,6 @@ STRUCTURE:
 # FORENSIC AUDIT EXECUTIVE DOSSIER
 
 ## 1. Executive Summary & Verified Exposure
-(You must include these exact two bullet points verbatim):
 - **Total Combined Rows:** {exact_total_rows}
 - **Total Flagged Anomalies:** {exact_flagged_count}
 
@@ -342,10 +336,12 @@ STRUCTURE:
 
     final_report = GT_TOKEN_PATTERN.sub(_substitute, raw_report)
 
-    # --- 5. Post-Generation Sentry Verification Layer ---
+    # --- 5. Post-Generation Sentry Verification & Auto-Repair Layer ---
     sentry_warnings = _verify_no_unverified_currency(final_report, known_currency_values)
 
-    total_match = re.search(r'Total Combined Rows:\s*\*?\*?\s*(\d[\d,]*)', final_report, re.IGNORECASE)
+    # Broad, resilient pattern to capture row counts regardless of markdown style variations
+    total_match = re.search(r'Total\s+(?:Combined\s+)?Rows?[^0-9\n]*?(\d[\d,]*)', final_report, re.IGNORECASE)
+    
     if total_match:
         claimed_rows = int(total_match.group(1).replace(',', ''))
         if claimed_rows != exact_total_rows:
@@ -354,7 +350,16 @@ STRUCTURE:
                 f"but verified data contains exactly {exact_total_rows:,} rows."
             )
     else:
-        sentry_warnings.append("Sentry Alert: LLM failed to explicitly state 'Total Combined Rows' in the required format.")
+        # Programmatic Auto-Repair: Prepend Section 1 with Python-verified numbers if LLM omitted them
+        summary_header = "## 1. Executive Summary & Verified Exposure"
+        verified_bullets = (
+            f"\n- **Total Combined Rows:** {exact_total_rows:,}\n"
+            f"- **Total Flagged Anomalies:** {exact_flagged_count:,}\n\n"
+        )
+        if summary_header in final_report:
+            final_report = final_report.replace(summary_header, summary_header + "\n" + verified_bullets)
+        else:
+            final_report = f"# FORENSIC AUDIT EXECUTIVE DOSSIER\n\n{summary_header}\n{verified_bullets}" + final_report
 
     blocking_problems = [w for w in sentry_warnings if w.startswith("Sentry Alert: report contains")
                          or w.startswith("Sentry Alert:") and "not substituted" in w]
