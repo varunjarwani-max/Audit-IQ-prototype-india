@@ -37,8 +37,6 @@ except ImportError:
 
 logger = logging.getLogger("auditiq.groq_advisor")
 if not logger.handlers:
-    # Ensure at least one handler exists so exceptions actually reach
-    # Streamlit Cloud's log viewer instead of vanishing silently.
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logger.addHandler(_handler)
@@ -64,11 +62,51 @@ def _valid_keys(api_keys: List[str]) -> List[str]:
     return [k.strip() for k in api_keys if k and k.strip() and not k.strip().endswith("_PLACEHOLDER")]
 
 
+def _is_flagged_finding(f: Dict[str, Any]) -> bool:
+    """Flexible check for flagged findings across various schema conventions."""
+    if not isinstance(f, dict):
+        return False
+    status = f.get("status")
+    # If no explicit status key exists, assume findings in list are flagged anomalies
+    if status is None:
+        return True
+    return str(status).upper() in ("FLAGGED", "TRUE", "HIGH", "CRITICAL", "YES", "ANOMALY")
+
+
+def _clean_and_preserve_finding(f: Dict[str, Any]) -> Dict[str, Any]:
+    """Extracts finding details dynamically while truncating text to optimize token usage."""
+    cleaned = {}
+
+    # 1. Extract Rule ID or Category
+    cleaned["rule"] = (
+        f.get("rule_id") or f.get("rule_code") or f.get("rule") or f.get("category") or "ANOMALY"
+    )
+
+    # 2. Extract Finding Description (checks all standard schema keys)
+    description = (
+        f.get("finding") or
+        f.get("description") or
+        f.get("details") or
+        f.get("message") or
+        f.get("issue") or
+        f.get("observation") or
+        ""
+    )
+    cleaned["finding"] = str(description)[:200] if description else "Flagged anomaly detected."
+
+    # 3. Preserve critical forensic identifiers if present
+    for identifier in ["row", "row_index", "voucher_no", "vendor", "vendor_name", "account", "severity", "amount"]:
+        if identifier in f and f[identifier] is not None:
+            cleaned[identifier] = f[identifier]
+
+    return cleaned
+
+
 def _call_groq_with_retry(
     messages: List[Dict[str, str]],
     model: str = "openai/gpt-oss-20b",
     max_tokens: int = 1500,
-    temperature: float = 0.0,  # Set to 0.0 for strict deterministic adherence
+    temperature: float = 0.0,
     max_backoff_rounds: int = 3,
     allow_fallback: bool = True
 ) -> str:
@@ -217,7 +255,7 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
         exact_total_rows += rows
 
         findings = data.get("findings", [])
-        flagged = [f for f in findings if f.get("status") == "FLAGGED"]
+        flagged = [f for f in findings if _is_flagged_finding(f)]
         exact_flagged_count += len(flagged)
 
         domain_breakdown.append({
@@ -227,29 +265,22 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
             "exact_flagged_anomalies": len(flagged)
         })
 
-    # --- 2. Tokenization & Payload Optimization Layer ---
+    # --- 2. Tokenization & Data Plumbing Layer ---
     token_registry: Dict[str, str] = {}
     value_to_token: Dict[str, str] = {}
 
     tokenized_domain_findings = []
     for filename, data in all_domain_data.items():
-        # Cap at top 4 flagged items per domain and trim fields to prevent TPM 413 limits
-        flagged_raw = [f for f in data.get("findings", []) if f.get("status") == "FLAGGED"][:4]
+        findings = data.get("findings", [])
+        flagged_raw = [f for f in findings if _is_flagged_finding(f)][:5]  # Top 5 detailed findings per domain
         
-        trimmed_subset = []
-        for f in flagged_raw:
-            trimmed_subset.append({
-                "rule": f.get("rule_id") or f.get("category"),
-                "finding": str(f.get("finding", ""))[:120],  # Truncate lengthy descriptions
-                "severity": f.get("severity")
-            })
-
-        tokenized_subset = _tokenize_currency(trimmed_subset, token_registry, value_to_token)
+        cleaned_subset = [_clean_and_preserve_finding(f) for f in flagged_raw]
+        tokenized_subset = _tokenize_currency(cleaned_subset, token_registry, value_to_token)
         tokenized_domain_findings.append((filename, tokenized_subset))
 
     known_currency_values = set(token_registry.values())
 
-    # --- 3. Prompt Construction ---
+    # --- 3. Injection & Prompt Construction Layer ---
     token_glossary = "\n".join(f"{tok} = {val}" for tok, val in token_registry.items())
 
     prompt = f"""
@@ -269,7 +300,8 @@ digits yourself. Never compute, retype, round, or paraphrase a rupee figure as a
 always use its token.
 {token_glossary if token_glossary else "(no rupee figures in this batch)"}
 
-DOMAIN FINDINGS SUMMARY (Top flags per domain, rupee figures replaced with tokens above):
+ITEMIZED DOMAIN FINDINGS TELEMETRY:
+Below are the itemized audit findings per file. Cite specific rule codes, voucher numbers, row indexes, vendor names, and monetary tokens directly in your report.
 """
     for filename, tokenized_subset in tokenized_domain_findings:
         prompt += f"\nFile: {filename}\n{json.dumps(tokenized_subset, default=str)}\n"
@@ -284,7 +316,7 @@ STRUCTURE:
 - **Total Flagged Anomalies:** {exact_flagged_count}
 
 ## 2. Multi-Domain Anomaly Register
-(Detail key findings. For every rupee figure, use its [[GT_n]] token -- never type digits.)
+(Detail itemized key findings using exact rule codes, voucher numbers, vendor names, and [[GT_n]] tokens. Do not write generic boilerplate.)
 
 ## 3. Recommended Substantive Audit Procedures
 """
@@ -293,9 +325,9 @@ STRUCTURE:
         {
             "role": "system",
             "content": (
-                "You are a Forensic Auditor. You never perform arithmetic and you never type "
-                "a rupee digit yourself. Every monetary figure must be inserted as its exact "
-                "[[GT_n]] token, copied verbatim from the glossary you are given."
+                "You are a Forensic Auditor. You cite specific itemized telemetry (rule codes, vendors, vouchers) "
+                "from the findings provided. You never perform arithmetic and never type rupee digits yourself. "
+                "Every monetary figure must be inserted as its exact [[GT_n]] token, copied verbatim from the glossary."
             )
         },
         {"role": "user", "content": prompt}
@@ -303,7 +335,7 @@ STRUCTURE:
 
     raw_report = _call_groq_with_retry(messages, max_tokens=1500, temperature=0.0)
 
-    # --- 4. Token Substitution ---
+    # --- 4. Token Substitution Layer ---
     def _substitute(match: "re.Match") -> str:
         token = match.group(0)
         return token_registry.get(token, token)
@@ -338,7 +370,7 @@ STRUCTURE:
 
 def generate_executive_memo(category: str, findings: List[Dict[str, Any]], batch_df_records: List[Dict[str, Any]], confidence: float) -> str:
     """Generates a formal 5C Internal Audit Workpaper Memo for a batch."""
-    flagged_records = [f for f in findings if f.get("status") == "FLAGGED"]
+    flagged_records = [f for f in findings if _is_flagged_finding(f)]
 
     prompt = f"""
 Draft a formal 5C Audit Workpaper Memo.
