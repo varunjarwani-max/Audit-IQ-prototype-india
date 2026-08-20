@@ -4,15 +4,15 @@ Groq LLM Client & 5C Audit Workpaper Generator for AuditIQ.
 Architecture Note (Privacy & Deployment):
 - The core detection engine runs 100% locally and deterministically on-premise without external network calls.
 - This advisor module provides LLM-assisted drafting of formal 5C Internal Audit Workpapers.
-- In this environment, it routes to Groq Cloud API for ultra-low latency validation; in air-gapped CA production,
-  the endpoint can be seamlessly toggled to an on-premise inference server (e.g. Ollama or vLLM at localhost:11434).
-- Includes exponential backoff retry logic and automatic model fallback to handle rate limits gracefully.
+- Fixed to use openai/gpt-oss-20b with internal fallback to llama-3.1-8b-instant.
+- Includes automated key rotation across 5 predefined keys to survive rate limits.
 """
 
 import json
 import time
 import random
-from typing import Dict, List, Any, Optional
+import streamlit as st
+from typing import Dict, List, Any
 
 try:
     from groq import Groq
@@ -22,130 +22,108 @@ except ImportError:
     import urllib.request
     import urllib.error
 
-# Kept strictly to the unified 20B model for synthesis/generation, and 8B for fallback/speed tests.
-SUPPORTED_MODELS = [
-    {"id": "openai/gpt-oss-20b", "name": "OpenAI GPT-OSS 20B (16GB On-Premise Target)"},
-    {"id": "llama-3.1-8b-instant", "name": "Llama 3.1 8B Instant (Edge/Local Low-Footprint Fallback)"}
+# Load from Streamlit secrets, defaulting to placeholders if not set in secrets.toml
+GROQ_API_KEYS = [
+    st.secrets.get("GROQ_API_KEY_1", "GROQ_API_KEY_1_PLACEHOLDER"),
+    st.secrets.get("GROQ_API_KEY_2", "GROQ_API_KEY_2_PLACEHOLDER"),
+    st.secrets.get("GROQ_API_KEY_3", "GROQ_API_KEY_3_PLACEHOLDER"),
+    st.secrets.get("GROQ_API_KEY_4", "GROQ_API_KEY_4_PLACEHOLDER"),
+    st.secrets.get("GROQ_API_KEY_5", "GROQ_API_KEY_5_PLACEHOLDER")
 ]
 
 
 def _call_groq_with_retry(
-    api_key: str,
-    model: str,
     messages: List[Dict[str, str]],
+    model: str = "openai/gpt-oss-20b",
     max_tokens: int = 1500,
     temperature: float = 0.2,
-    max_retries: int = 4,
+    max_backoff_rounds: int = 3,
     allow_fallback: bool = True
 ) -> str:
     """
-    Executes a chat completion call with exponential backoff and jitter to survive HTTP 429 rate-limiting.
-    Includes an automatic fallback to llama-3.1-8b-instant if the primary gpt-oss-20b model fully fails.
+    Executes a chat completion call with automatic key rotation and exponential backoff.
+    Tries the next key immediately on 429 rate limit. If all 5 keys fail, it backs off 
+    exponentially before retrying the pool. Falls back to 8B model if 20B fails completely.
     """
-    cleaned_key = api_key.strip()
     last_exception = None
 
-    for attempt in range(max_retries):
-        try:
-            if GROQ_SDK_AVAILABLE:
-                client = Groq(api_key=cleaned_key)
-                completion = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                return completion.choices[0].message.content
-            else:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {cleaned_key}"
-                }
-                payload = json.dumps({
-                    "model": model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens
-                }).encode("utf-8")
-
-                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=35) as response:
-                    result = json.loads(response.read().decode("utf-8"))
-                    return result["choices"][0]["message"]["content"]
-
-        except Exception as e:
-            err_str = str(e).lower()
-            last_exception = e
-            
-            # Check for HTTP 429 / Rate Limit
-            is_rate_limit = "429" in err_str or "rate limit" in err_str or "tpm" in err_str or "rpm" in err_str
-            
-            if is_rate_limit and attempt < max_retries - 1:
-                # Exponential backoff with random jitter: 2s, 4s, 8s + jitter
-                sleep_time = (2 ** (attempt + 1)) + random.uniform(0.5, 1.5)
-                time.sleep(sleep_time)
+    for round_num in range(max_backoff_rounds):
+        for api_key in GROQ_API_KEYS:
+            cleaned_key = api_key.strip()
+            if not cleaned_key or cleaned_key.endswith("_PLACEHOLDER"):
                 continue
-            elif attempt < max_retries - 1 and ("timeout" in err_str or "connection" in err_str):
-                time.sleep(1.5)
-                continue
-            else:
-                break
-    
-    # Fallback Logic: If the 20B target fails all retries, instantly drop to the 8B fallback.
+
+            try:
+                if GROQ_SDK_AVAILABLE:
+                    client = Groq(api_key=cleaned_key)
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
+                    return completion.choices[0].message.content
+                else:
+                    url = "https://api.groq.com/openai/v1/chat/completions"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {cleaned_key}"
+                    }
+                    payload = json.dumps({
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens
+                    }).encode("utf-8")
+
+                    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+                    with urllib.request.urlopen(req, timeout=35) as response:
+                        result = json.loads(response.read().decode("utf-8"))
+                        return result["choices"][0]["message"]["content"]
+
+            except Exception as e:
+                err_str = str(e).lower()
+                last_exception = e
+                
+                # If rate-limited or timeout, immediately continue to the next key in the loop
+                if "429" in err_str or "rate limit" in err_str or "tpm" in err_str or "rpm" in err_str:
+                    continue
+                elif "timeout" in err_str or "connection" in err_str:
+                    continue
+                else:
+                    # For bad requests/other errors, still try next key just in case it's a key-specific issue
+                    continue
+
+        # If we reach here, ALL valid keys failed in this round. Apply exponential backoff before the next round.
+        if round_num < max_backoff_rounds - 1:
+            sleep_time = (2 ** (round_num + 1)) + random.uniform(0.5, 1.5)
+            time.sleep(sleep_time)
+
+    # Fallback Logic: If the 20B target exhausts all keys and backoff rounds, drop to the 8B fallback.
     if allow_fallback and model == "openai/gpt-oss-20b":
         return _call_groq_with_retry(
-            api_key=api_key,
-            model="llama-3.1-8b-instant",
             messages=messages,
+            model="llama-3.1-8b-instant",
             max_tokens=max_tokens,
             temperature=temperature,
-            max_retries=2, # Shorter retry loop for the fallback
+            max_backoff_rounds=1, # Shorter retry loops for the fallback
             allow_fallback=False
         )
 
-    raise RuntimeError(f"Groq generation failed with model '{model}' after {max_retries} attempts: {str(last_exception)}")
-
-
-def test_groq_key(api_key: str, model: str = "llama-3.1-8b-instant") -> Dict[str, Any]:
-    """Tests the Groq API key with a fast ping call using the lightest model."""
-    if not api_key or not api_key.strip():
-        return {"success": False, "message": "No API key provided."}
-
-    try:
-        messages = [
-            {"role": "system", "content": "You are a ping test assistant. Respond strictly with 'OK'."},
-            {"role": "user", "content": "Ping"}
-        ]
-        _call_groq_with_retry(api_key, model, messages, max_tokens=10, max_retries=2, allow_fallback=False)
-        return {"success": True, "message": f"Connection verified successfully using {model}!"}
-    except Exception as e:
-        return {"success": False, "message": f"Groq verification failed: {str(e)}"}
+    raise RuntimeError(f"Groq generation failed with model '{model}' after exhausting all keys: {str(last_exception)}")
 
 
 def generate_executive_memo(
-    api_key: str,
     category: str,
     findings: List[Dict[str, Any]],
     batch_df_records: List[Dict[str, Any]],
-    confidence: float,
-    model: str = "openai/gpt-oss-20b"
+    confidence: float
 ) -> str:
     """
     Generates a formal 5C Internal Audit Workpaper Memo across the batch findings.
-    Adheres strictly to the professional 5C Audit Standard:
-    1. Condition (What was found)
-    2. Criteria (What policy / accounting rule applies)
-    3. Cause (Why the deviation happened)
-    4. Consequence / Risk (Financial & regulatory exposure)
-    5. Corrective Action (Immediate remediation)
     """
-    if not api_key or not api_key.strip():
-        raise ValueError("Groq API key is missing. Please enter your key in the sidebar.")
-
     flagged_records = [f for f in findings if f.get("status") == "FLAGGED"]
 
-    # Keep payload concise to protect Groq TPM budget on free-tier
     concise_findings = []
     for f in findings[:10]:
         concise_findings.append({
@@ -183,7 +161,7 @@ Structure your response strictly following the 5C Internal Audit Framework:
 # FORENSIC AUDIT WORKPAPER MEMO
 **Engagement:** Internal Control & Data Segregation Review
 **Audit Scope:** {category.upper()} Ledger Slice
-**AI Draft Engine:** {model} (Deterministic Rule-Grounded)
+**AI Draft Engine:** openai/gpt-oss-20b (Deterministic Rule-Grounded)
 
 ## 1. CONDITION (What Was Found)
 State the exact factual deviations detected (cite Row #, amounts in INR with ₹ formatting, vendor/account names, and triggered rule codes).
@@ -206,21 +184,16 @@ Provide actionable, itemized recommendations for management and workpaper sign-o
         {"role": "user", "content": prompt}
     ]
 
-    return _call_groq_with_retry(api_key, model, messages, max_tokens=1500, temperature=0.15)
+    return _call_groq_with_retry(messages, max_tokens=1500, temperature=0.15)
 
 
 def generate_5c_finding_memo(
-    api_key: str,
     record: Dict[str, Any],
-    category: str,
-    model: str = "openai/gpt-oss-20b"
+    category: str
 ) -> str:
     """
     Generates a dedicated, single-record 5C workpaper memo for an individual flagged transaction.
     """
-    if not api_key or not api_key.strip():
-        raise ValueError("Groq API key is missing.")
-
     prompt = f"""
 Draft a concise 5C Workpaper Note for this individual flagged record in the {category} module:
 
@@ -240,21 +213,16 @@ STRUCTURE:
         {"role": "user", "content": prompt}
     ]
 
-    return _call_groq_with_retry(api_key, model, messages, max_tokens=600, temperature=0.1)
+    return _call_groq_with_retry(messages, max_tokens=600, temperature=0.1)
 
 
 def generate_consolidated_master_report(
-    api_key: str,
-    all_domain_data: Dict[str, Any],
-    model: str = "openai/gpt-oss-20b"
+    all_domain_data: Dict[str, Any]
 ) -> str:
     """
     Synthesizes findings across multiple datasets (Transactions, GL, AR/AP, Fixed Assets) 
     into a single partner-level executive dossier.
     """
-    if not api_key or not api_key.strip():
-        raise ValueError("Groq API key is missing. Please enter your key in the sidebar.")
-
     master_summary = []
     
     for filename, data in all_domain_data.items():
@@ -299,5 +267,4 @@ Maintain a strictly professional, objective, and authoritative forensic accounti
         {"role": "user", "content": prompt}
     ]
 
-    # Leverages existing _call_groq_with_retry for rate limits, connection issues, and automatic fallback
-    return _call_groq_with_retry(api_key, model, messages, max_tokens=2000, temperature=0.2)
+    return _call_groq_with_retry(messages, max_tokens=2000, temperature=0.2)
