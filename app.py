@@ -1,270 +1,242 @@
 """
-Groq LLM Client & 5C Audit Workpaper Generator for AuditIQ.
+AuditIQ - Data Segregation & Routing Layer
+Pure Python & Streamlit Application
 
-Architecture Note (Privacy & Deployment):
-- The core detection engine runs 100% locally and deterministically on-premise without external network calls.
-- This advisor module provides LLM-assisted drafting of formal 5C Internal Audit Workpapers.
-- Fixed to use openai/gpt-oss-20b with internal fallback to llama-3.1-8b-instant.
-- Includes automated key rotation across 5 predefined keys to survive rate limits.
+Run locally with:
+    streamlit run app.py
 """
 
-import json
-import time
-import random
 import streamlit as st
-from typing import Dict, List, Any
 
-try:
-    from groq import Groq
-    GROQ_SDK_AVAILABLE = True
-except ImportError:
-    GROQ_SDK_AVAILABLE = False
-    import urllib.request
-    import urllib.error
+# Must strictly be the very first Streamlit command executed
+st.set_page_config(
+    page_title="AuditIQ - Data Segregation & Routing",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Load from Streamlit secrets, defaulting to placeholders if not set in secrets.toml
-GROQ_API_KEYS = [
-    st.secrets.get("GROQ_API_KEY_1", "GROQ_API_KEY_1_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_2", "GROQ_API_KEY_2_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_3", "GROQ_API_KEY_3_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_4", "GROQ_API_KEY_4_PLACEHOLDER"),
-    st.secrets.get("GROQ_API_KEY_5", "GROQ_API_KEY_5_PLACEHOLDER")
-]
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
 
+# Local helper modules imported AFTER set_page_config
+from detector import classify_columns, ALIAS_DEFINITIONS
+from rules_engine import audit_transactions, audit_aging, audit_general_ledger, audit_fixed_assets
+from groq_advisor import generate_executive_memo, generate_5c_finding_memo, generate_consolidated_master_report
+from sample_data import SAMPLE_DATASETS
 
-def _call_groq_with_retry(
-    messages: List[Dict[str, str]],
-    model: str = "openai/gpt-oss-20b",
-    max_tokens: int = 1500,
-    temperature: float = 0.2,
-    max_backoff_rounds: int = 3,
-    allow_fallback: bool = True
-) -> str:
-    """
-    Executes a chat completion call with automatic key rotation and exponential backoff.
-    Tries the next key immediately on 429 rate limit. If all 5 keys fail, it backs off 
-    exponentially before retrying the pool. Falls back to 8B model if 20B fails completely.
-    """
-    last_exception = None
+# ---------------------------------------------------------
+# Clean Minimalism Custom CSS
+# ---------------------------------------------------------
+st.markdown("""
+<style>
+    .stApp, .stApp p, .stApp span, .stApp label, 
+    .stMarkdown, h1, h2, h3, h4, h5, h6,
+    [data-testid="stSidebar"] *,
+    .stDataFrame, .stTable {
+        color: #0F172A !important;
+    }
+    .stApp {
+        background-color: #F8FAFC !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    section[data-testid="stSidebar"] {
+        background-color: #FFFFFF !important;
+        border-right: 1px solid #E2E8F0 !important;
+    }
+    .metric-card {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 16px 20px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+        margin-bottom: 12px;
+    }
+    .metric-label {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: #64748B !important;
+        letter-spacing: 0.05em;
+        margin-bottom: 4px;
+    }
+    .metric-value {
+        font-size: 20px;
+        font-weight: 800;
+        color: #0F172A !important;
+    }
+    .finding-box {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 12px;
+    }
+    .badge-critical { background-color: #FEE2E2; color: #991B1B !important; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+    .badge-high { background-color: #FEF3C7; color: #92400E !important; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+</style>
+""", unsafe_allow_html=True)
 
-    for round_num in range(max_backoff_rounds):
-        for api_key in GROQ_API_KEYS:
-            cleaned_key = api_key.strip()
-            if not cleaned_key or cleaned_key.endswith("_PLACEHOLDER"):
-                continue
+# ---------------------------------------------------------
+# Session State Initialization
+# ---------------------------------------------------------
+if "batch_index" not in st.session_state: st.session_state["batch_index"] = 0
+if "working_df" not in st.session_state: st.session_state["working_df"] = SAMPLE_DATASETS["transactions"]["df"].copy()
+if "override_category" not in st.session_state: st.session_state["override_category"] = None
+if "custom_col_map" not in st.session_state: st.session_state["custom_col_map"] = {}
+if "individual_memos" not in st.session_state: st.session_state["individual_memos"] = {}
+if "multi_file_data" not in st.session_state: st.session_state["multi_file_data"] = {}
+if "active_file_name" not in st.session_state: st.session_state["active_file_name"] = None
 
-            try:
-                if GROQ_SDK_AVAILABLE:
-                    client = Groq(api_key=cleaned_key)
-                    completion = client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens
-                    )
-                    return completion.choices[0].message.content
-                else:
-                    url = "https://api.groq.com/openai/v1/chat/completions"
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {cleaned_key}"
-                    }
-                    payload = json.dumps({
-                        "model": model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens
-                    }).encode("utf-8")
-
-                    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                    with urllib.request.urlopen(req, timeout=35) as response:
-                        result = json.loads(response.read().decode("utf-8"))
-                        return result["choices"][0]["message"]["content"]
-
-            except Exception as e:
-                err_str = str(e).lower()
-                last_exception = e
-                
-                # If rate-limited or timeout, immediately continue to the next key in the loop
-                if "429" in err_str or "rate limit" in err_str or "tpm" in err_str or "rpm" in err_str:
-                    continue
-                elif "timeout" in err_str or "connection" in err_str:
-                    continue
-                else:
-                    # For bad requests/other errors, still try next key just in case it's a key-specific issue
-                    continue
-
-        # If we reach here, ALL valid keys failed in this round. Apply exponential backoff before the next round.
-        if round_num < max_backoff_rounds - 1:
-            sleep_time = (2 ** (round_num + 1)) + random.uniform(0.5, 1.5)
-            time.sleep(sleep_time)
-
-    # Fallback Logic: If the 20B target exhausts all keys and backoff rounds, drop to the 8B fallback.
-    if allow_fallback and model == "openai/gpt-oss-20b":
-        return _call_groq_with_retry(
-            messages=messages,
-            model="llama-3.1-8b-instant",
-            max_tokens=max_tokens,
-            temperature=temperature,
-            max_backoff_rounds=1, # Shorter retry loops for the fallback
-            allow_fallback=False
-        )
-
-    raise RuntimeError(f"Groq generation failed with model '{model}' after exhausting all keys: {str(last_exception)}")
-
-
-def generate_executive_memo(
-    category: str,
-    findings: List[Dict[str, Any]],
-    batch_df_records: List[Dict[str, Any]],
-    confidence: float
-) -> str:
-    """
-    Generates a formal 5C Internal Audit Workpaper Memo across the batch findings.
-    """
-    flagged_records = [f for f in findings if f.get("status") == "FLAGGED"]
-
-    concise_findings = []
-    for f in findings[:10]:
-        concise_findings.append({
-            "row_index": f.get("row_index"),
-            "status": f.get("status"),
-            "risk_score": f.get("risk_score"),
-            "flags": [
-                {
-                    "rule_code": flg.get("rule_code"),
-                    "rule_name": flg.get("rule_name"),
-                    "severity": flg.get("severity"),
-                    "detected_value": flg.get("detected_value")
-                }
-                for flg in f.get("flags", [])
-            ]
-        })
-
-    prompt = f"""
-You are an expert Senior Forensic Internal Auditor and Chartered Accountant.
-Evaluate this financial audit batch and draft a formal 5C Audit Workpaper Memo.
-
-METADATA:
-- Category: {category} (Signature Confidence: {confidence}%)
-- Batch Evaluated: {len(findings)} records | Flagged Anomalies: {len(flagged_records)}
-
-DETERMINISTIC FINDINGS SUMMARY:
-{json.dumps(concise_findings, indent=2)}
-
-SAMPLE DATA ROWS:
-{json.dumps(batch_df_records[:5], indent=2)}
-
-FORMAT INSTRUCTIONS:
-Structure your response strictly following the 5C Internal Audit Framework:
-
-# FORENSIC AUDIT WORKPAPER MEMO
-**Engagement:** Internal Control & Data Segregation Review
-**Audit Scope:** {category.upper()} Ledger Slice
-**AI Draft Engine:** openai/gpt-oss-20b (Deterministic Rule-Grounded)
-
-## 1. CONDITION (What Was Found)
-State the exact factual deviations detected (cite Row #, amounts in INR with ₹ formatting, vendor/account names, and triggered rule codes).
-
-## 2. CRITERIA (Governing Standards)
-State the applicable internal authorization thresholds (e.g. ₹50,000 dual-signoff limit), ICAI accounting standards, or SOX-404 segregation of duties requirements.
-
-## 3. CAUSE (Root Failure Mode)
-Explain the operational breakdown (e.g. circumvented approval workflow, lack of maker-checker controls, ERP timestamp override, or split purchase orders).
-
-## 4. CONSEQUENCE (Financial & Compliance Risk)
-Detail the exposure (potential fraudulent diversion, structuring penalty, unrecorded liability, or statutory audit qualification).
-
-## 5. CORRECTIVE ACTION & REMEDIATION
-Provide actionable, itemized recommendations for management and workpaper sign-off steps for the Lead Engagement Partner.
-"""
-
-    messages = [
-        {"role": "system", "content": "You are a licensed Chartered Accountant and Forensic Auditor. Write strictly in objective, evidence-based professional audit terminology."},
-        {"role": "user", "content": prompt}
-    ]
-
-    return _call_groq_with_retry(messages, max_tokens=1500, temperature=0.15)
-
-
-def generate_5c_finding_memo(
-    record: Dict[str, Any],
-    category: str
-) -> str:
-    """
-    Generates a dedicated, single-record 5C workpaper memo for an individual flagged transaction.
-    """
-    prompt = f"""
-Draft a concise 5C Workpaper Note for this individual flagged record in the {category} module:
-
-RECORD DATA:
-{json.dumps(record, indent=2)}
-
-STRUCTURE:
-- **Condition:** Exact factual violation detected.
-- **Criteria:** Governing internal control or accounting rule.
-- **Cause:** Process failure or control gap.
-- **Consequence:** Quantified exposure in ₹ INR.
-- **Corrective Action:** Immediate action required prior to audit clearance.
-"""
-
-    messages = [
-        {"role": "system", "content": "You are a CA Forensic Auditor drafting a precise 5C workpaper note."},
-        {"role": "user", "content": prompt}
-    ]
-
-    return _call_groq_with_retry(messages, max_tokens=600, temperature=0.1)
-
-
-def generate_consolidated_master_report(
-    all_domain_data: Dict[str, Any]
-) -> str:
-    """
-    Synthesizes findings across multiple datasets (Transactions, GL, AR/AP, Fixed Assets) 
-    into a single partner-level executive dossier.
-    """
-    master_summary = []
+# ---------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------
+with st.sidebar:
+    st.markdown("### 🛡️ **AuditIQ**")
+    st.caption("Data Segregation & Anomaly Routing Engine")
+    st.divider()
     
-    for filename, data in all_domain_data.items():
-        flagged_items = [f for f in data.get("findings", []) if f.get("status") == "FLAGGED"]
-        
-        domain_block = {
-            "file": filename,
-            "domain": data.get("category", "Unknown"),
-            "total_rows_evaluated": len(data.get("df", [])),
-            "flagged_count": len(flagged_items),
-            "critical_flags": []
-        }
-        
-        # Pull top 10 most critical flags per domain to avoid token overflow
-        for item in flagged_items[:10]:
-            domain_block["critical_flags"].append({
-                "row": item.get("row_index"),
-                "flags": item.get("flags")
-            })
+    st.markdown("#### ⚙️ **Audit Thresholds & Date**")
+    st.session_state["txn_threshold"] = st.number_input("Txn Sign-off Limit (₹ INR)", value=float(st.session_state.get("txn_threshold", 50000.0)), step=5000.0)
+    as_of_date_input = st.text_input("Benchmark As-Of Date", value=st.session_state.get("as_of_date_val", ""), placeholder="e.g. 2024-10-31 (default: auto)")
+    st.session_state["as_of_date_val"] = as_of_date_input.strip() if as_of_date_input else None
+
+# ---------------------------------------------------------
+# Main App Header & Multi-File Ingestion
+# ---------------------------------------------------------
+st.title("AuditIQ Data Segregation Layer")
+st.markdown("Ingest multiple financial files simultaneously. AuditIQ will auto-route each to its respective engine and generate a unified Master Report.")
+
+uploaded_files = st.file_uploader(
+    "Upload Financial Data Files (CSV or Excel)",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    if len(uploaded_files) != len(st.session_state["multi_file_data"]):
+        st.session_state["multi_file_data"] = {}
+        for file in uploaded_files:
+            df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
+            classification = classify_columns(list(df.columns))
+            category = classification["category"]
+            if category == "ambiguous": category = classification["raw_best_category"]
             
-        master_summary.append(domain_block)
+            col_map = classification["matched_columns"]
+            findings = []
+            if category == "transactions": findings = audit_transactions(df, col_map, threshold_limit=st.session_state["txn_threshold"])
+            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=st.session_state.get("as_of_date_val"))
+            elif category == "general_ledger": findings = audit_general_ledger(df, col_map, period_end_days=4)
+            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=st.session_state.get("as_of_date_val"))
+            
+            st.session_state["multi_file_data"][file.name] = {
+                "df": df,
+                "category": category,
+                "findings": findings,
+                "classification": classification
+            }
         
-    prompt = f"""
-You are an elite Senior Audit Partner at a Big 4 accounting firm.
-Review the following cross-domain anomaly telemetry extracted by the AuditIQ deterministic engine.
+        st.session_state["active_file_name"] = uploaded_files[0].name
+        st.session_state["working_df"] = st.session_state["multi_file_data"][uploaded_files[0].name]["df"]
+        st.session_state["override_category"] = None
+        st.session_state["custom_col_map"] = {}
+        st.rerun()
 
-DATA INGESTED:
-{json.dumps(master_summary, indent=2)}
+# ---------------------------------------------------------
+# Consolidated Dashboard & Master Report Generation
+# ---------------------------------------------------------
+if st.session_state["multi_file_data"]:
+    st.markdown("---")
+    st.markdown("### 🌐 Consolidated Multi-Domain Dashboard")
+    
+    total_files = len(st.session_state["multi_file_data"])
+    total_anomalies = sum(len([f for f in data["findings"] if f["status"] == "FLAGGED"]) for data in st.session_state["multi_file_data"].values())
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Domains Analyzed", total_files)
+    c2.metric("Total Rows Processed", sum(len(data["df"]) for data in st.session_state["multi_file_data"].values()))
+    c3.metric("Total Flagged Anomalies", total_anomalies)
 
-Draft a formal, partner-level 'Executive Roll-Up Memo'.
-Structure the response exactly as follows:
-1. Executive Summary & Exposure Overview
-2. Multi-Domain Anomaly Register (Summarize the worst findings across domains)
-3. Control Environment Assessment
-4. Recommended Substantive Audit Procedures
+    if st.button("✨ Generate Unified Master Report", type="primary", use_container_width=True):
+        with st.spinner("Synthesizing multi-domain executive dossier..."):
+            master_memo = generate_consolidated_master_report(
+                all_domain_data=st.session_state["multi_file_data"]
+            )
+            st.markdown("#### 📑 Master Executive Dossier")
+            st.markdown(master_memo)
+            st.download_button("📥 Download Master Report", data=master_memo, file_name="AuditIQ_Master_Report.md", mime="text/markdown")
 
-Maintain a strictly professional, objective, and authoritative forensic accounting tone.
-"""
+    st.markdown("---")
+    
+    selected_file = st.selectbox("Select File for Interactive Deep Dive:", options=list(st.session_state["multi_file_data"].keys()))
+    if selected_file != st.session_state["active_file_name"]:
+        st.session_state["active_file_name"] = selected_file
+        st.session_state["working_df"] = st.session_state["multi_file_data"][selected_file]["df"]
+        st.session_state["batch_index"] = 0
+        st.rerun()
 
-    messages = [
-        {"role": "system", "content": "You are a licensed Chartered Accountant and Forensic Auditor."},
-        {"role": "user", "content": prompt}
-    ]
+    current_df = st.session_state["working_df"]
+    active_data = st.session_state["multi_file_data"][st.session_state["active_file_name"]]
+    active_category = active_data["category"]
+    confidence = active_data["classification"]["confidence"]
+    effective_col_map = {**active_data["classification"]["matched_columns"], **st.session_state["custom_col_map"]}
+    all_findings = active_data["findings"]
 
-    return _call_groq_with_retry(messages, max_tokens=2000, temperature=0.2)
+    total_records = len(current_df)
+    total_flagged_all = sum(1 for f in all_findings if f["status"] == "FLAGGED")
+    
+    BATCH_SIZE = 5
+    total_batches = max(1, (total_records + BATCH_SIZE - 1) // BATCH_SIZE)
+    current_batch_idx = min(st.session_state["batch_index"], total_batches - 1)
+    batch_start_idx = current_batch_idx * BATCH_SIZE
+    batch_end_idx = min((current_batch_idx + 1) * BATCH_SIZE, total_records)
+    batch_df = current_df.iloc[batch_start_idx:batch_end_idx].copy()
+    batch_findings = all_findings[batch_start_idx:batch_end_idx]
+    batch_flagged_count = sum(1 for f in batch_findings if f["status"] == "FLAGGED")
+
+    st.markdown(f"### 🔍 Deep Dive: `{st.session_state['active_file_name']}` ({ALIAS_DEFINITIONS[active_category]['display_name']})")
+    
+    edited_batch_df = st.data_editor(batch_df, use_container_width=True, num_rows="dynamic", key=f"editor_batch_{current_batch_idx}")
+    if not edited_batch_df.equals(batch_df):
+        st.session_state["working_df"].iloc[batch_start_idx:batch_end_idx] = edited_batch_df
+        st.session_state["multi_file_data"] = {}
+        st.rerun()
+
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+    with nav_col1:
+        if st.button("⬅️ Previous 5", disabled=(current_batch_idx == 0), use_container_width=True):
+            st.session_state["batch_index"] = max(0, current_batch_idx - 1); st.rerun()
+    with nav_col2:
+        st.markdown(f"<div style='text-align: center; padding-top: 6px; font-size: 13px; font-weight: 600;'>Batch {current_batch_idx + 1} of {total_batches}</div>", unsafe_allow_html=True)
+    with nav_col3:
+        if st.button("Next 5 ➡️", disabled=(current_batch_idx >= total_batches - 1), use_container_width=True):
+            st.session_state["batch_index"] = min(total_batches - 1, current_batch_idx + 1); st.rerun()
+
+    st.divider()
+    if batch_flagged_count == 0:
+        st.success("✅ **Batch Slice Cleared**: No compliance violations detected in this 5-record window.")
+    else:
+        for item in batch_findings:
+            if item["status"] == "FLAGGED":
+                global_row_num = item["row_index"]
+                st.markdown(f"#### 🚩 Record #{global_row_num}")
+                for f in item["flags"]:
+                    sev = f["severity"]
+                    badge = "badge-critical" if sev == "CRITICAL" else "badge-high"
+                    st.markdown(f"""
+                    <div class="finding-box">
+                        <span class="{badge}">{sev}</span> <b>{f['rule_code']}</b>: {f['rule_name']}<br>
+                        <span style="font-size: 13px; color: #64748B;">{f['description']}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                memo_key = f"memo_row_{global_row_num}"
+                if memo_key in st.session_state["individual_memos"]:
+                    st.markdown(st.session_state["individual_memos"][memo_key])
+                else:
+                    if st.button(f"Generate 5C Note for Row #{global_row_num}", key=f"btn_5c_{global_row_num}"):
+                        note = generate_5c_finding_memo({"row_index": global_row_num, "data": current_df.iloc[global_row_num - 1].to_dict(), "flags": item["flags"]}, ALIAS_DEFINITIONS[active_category]['display_name'])
+                        st.session_state["individual_memos"][memo_key] = note
+                        st.rerun()
