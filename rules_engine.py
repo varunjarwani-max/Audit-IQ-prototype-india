@@ -286,10 +286,27 @@ def audit_general_ledger(
 ) -> List[Dict[str, Any]]:
     """
     Vectorized General Ledger Audit Rules:
-    1. GL-001: Double-Entry Voucher Imbalance (Debits != Credits)
-    2. GL-002: Non-Business Hours & Weekend Postings
-    3. GL-003: High-Risk Period-End Month-Close Adjustments
-    4. GL-004: Suspense / Unallocated Clearing Account Usage
+    1. GL-001:  Double-Entry Voucher Imbalance (Debits != Credits), for rows
+                carrying a real journal/voucher reference.
+    2. GL-001B: Missing Journal Reference (Balance Unverifiable) -- rows with
+                no reference are never pooled together to "check" a balance
+                across unrelated transactions.
+    3. GL-002:  Non-Business Hours & Weekend Postings
+    4. GL-003:  High-Risk Period-End Month-Close Adjustments
+    5. GL-004:  Suspense / Unallocated Clearing Account Usage
+
+    BUGFIX NOTES (see inline comments for detail):
+    - Previously, `groupby("_ref")` silently lumped every row with a blank
+      journal_reference into one bucket, summing debits/credits across
+      unrelated transactions and stamping a false CRITICAL "unbalanced
+      voucher" flag on every blank-ref row. This is fixed by excluding
+      blank/placeholder references from the balance check entirely.
+    - References are now case/whitespace-normalized so "JV-001" and
+      "jv-001" aren't treated as two different (and spuriously
+      "unbalanced") vouchers.
+    - A consistency assertion at the end cross-checks the per-row register
+      against the aggregate unbalanced-voucher set, so a register/summary
+      mismatch fails loudly here instead of silently reaching the UI.
     """
     findings = []
     if df is None or df.empty:
@@ -306,7 +323,11 @@ def audit_general_ledger(
     acc_series = working_df.get(col_acc, "").astype(str).fillna("").str.strip()
     dr_series = pd.to_numeric(working_df.get(col_dr, 0), errors="coerce").fillna(0)
     cr_series = pd.to_numeric(working_df.get(col_cr, 0), errors="coerce").fillna(0)
-    ref_series = working_df.get(col_ref, "").astype(str).fillna("").str.strip()
+
+    # Keep the original (display) reference separately from the normalized
+    # one used for grouping, so messages still show what was actually in the file.
+    raw_ref_series = working_df.get(col_ref, "").astype(str).fillna("").str.strip()
+    ref_series = raw_ref_series.str.upper()
 
     working_df["_date"] = date_series
     working_df["_acc"] = acc_series
@@ -314,9 +335,27 @@ def audit_general_ledger(
     working_df["_cr"] = cr_series
     working_df["_ref"] = ref_series
 
-    # Rule 1: Double-entry imbalance by journal reference
-    ref_totals = working_df.groupby("_ref").agg({"_dr": "sum", "_cr": "sum"})
-    unbalanced_refs = set(ref_totals[abs(ref_totals["_dr"] - ref_totals["_cr"]) > 0.01].index)
+    # --- BUGFIX (GL-001) ---
+    # Rows with a missing/blank/placeholder journal reference must NEVER be
+    # grouped together as if they were one voucher -- doing so sums debits and
+    # credits across unrelated transactions and produces a bogus "imbalance"
+    # that then gets stamped onto every blank-ref row. This is very likely
+    # the exact source of the register/summary contradiction: a downstream
+    # summary that (correctly) counts only *named* unbalanced voucher IDs
+    # reports 0, while the per-row register still carried GL-001 on every
+    # blank-ref row because "" itself qualified as "unbalanced".
+    MISSING_REF_TOKENS = {"", "NONE", "NULL", "NAN", "-", "N/A", "UNDEFINED"}
+    has_ref_mask = ~ref_series.isin(MISSING_REF_TOKENS)
+
+    ref_totals = (
+        working_df[has_ref_mask]
+        .groupby("_ref")
+        .agg({"_dr": "sum", "_cr": "sum"})
+    )
+    BALANCE_TOLERANCE = 0.01  # absorbs float rounding noise only, not real mismatches
+    unbalanced_refs = set(
+        ref_totals[abs(ref_totals["_dr"] - ref_totals["_cr"]) > BALANCE_TOLERANCE].index
+    )
 
     # Rule 2: Weekend Postings (Saturday = 5, Sunday = 6)
     weekend_mask = date_series.dt.dayofweek.isin([5, 6]).to_numpy()
@@ -333,19 +372,32 @@ def audit_general_ledger(
     for idx, row in enumerate(working_df.itertuples(index=False)):
         row_flags = []
         ref_val = str(ref_series.iloc[idx])
+        raw_ref_val = str(raw_ref_series.iloc[idx])
         acc_val = str(acc_series.iloc[idx])
         dr_val = float(dr_series.iloc[idx])
         cr_val = float(cr_series.iloc[idx])
         date_val = date_series.iloc[idx]
 
-        if ref_val in unbalanced_refs:
+        if ref_val in MISSING_REF_TOKENS:
+            # Never pooled with other blank-ref rows -- flagged honestly as
+            # "can't verify", not as a false CRITICAL imbalance.
+            row_flags.append({
+                "rule_code": "GL-001B",
+                "rule_name": "Missing Journal Reference (Balance Unverifiable)",
+                "severity": "MEDIUM",
+                "description": "Entry has no journal/voucher reference, so its debit/credit balance cannot be matched against a counter-leg.",
+                "detected_value": f"Reference: '{raw_ref_val}' | Debit: ₹{dr_val:,.2f} | Credit: ₹{cr_val:,.2f}",
+                "expected": "Every posting carries a unique journal reference linking it to its offsetting leg(s).",
+                "remediation": "Assign a valid journal/voucher reference and re-run the balance check."
+            })
+        elif ref_val in unbalanced_refs:
             tot_dr = ref_totals.loc[ref_val, "_dr"]
             tot_cr = ref_totals.loc[ref_val, "_cr"]
             row_flags.append({
                 "rule_code": "GL-001",
                 "rule_name": "Unbalanced Journal Voucher (Dr ≠ Cr)",
                 "severity": "CRITICAL",
-                "description": f"Voucher '{ref_val}' is out of balance: Total Dr = ₹{tot_dr:,.2f}, Total Cr = ₹{tot_cr:,.2f} (Diff: ₹{abs(tot_dr - tot_cr):,.2f}).",
+                "description": f"Voucher '{raw_ref_val}' is out of balance: Total Dr = ₹{tot_dr:,.2f}, Total Cr = ₹{tot_cr:,.2f} (Diff: ₹{abs(tot_dr - tot_cr):,.2f}).",
                 "detected_value": f"Debit: ₹{dr_val:,.2f} | Credit: ₹{cr_val:,.2f}",
                 "expected": "Total Debits must equal Total Credits per accounting standard.",
                 "remediation": "Reconcile offsetting credit/debit leg before posting to master ledger."
@@ -392,6 +444,26 @@ def audit_general_ledger(
             "status": "FLAGGED" if len(row_flags) > 0 else "CLEARED",
             "risk_score": min(100, len(row_flags) * 35)
         })
+
+    # --- Sentry-style consistency guard ---
+    # Recompute, from the finished per-row register itself, which reference
+    # IDs actually carry a GL-001 flag, and compare that to the aggregate
+    # `unbalanced_refs` set any downstream summary/dashboard would use.
+    # If a future edit reintroduces a divergence between "what the register
+    # shows" and "what the summary counts", this raises immediately instead
+    # of shipping a silently contradictory result to the UI.
+    distinct_flagged_refs = {
+        str(ref_series.iloc[i])
+        for i, f in enumerate(findings)
+        if any(fl["rule_code"] == "GL-001" for fl in f["flags"])
+    }
+    if distinct_flagged_refs != unbalanced_refs:
+        raise AssertionError(
+            "GL-001 consistency check failed: per-row register flags "
+            f"{distinct_flagged_refs} but the aggregate unbalanced-voucher "
+            f"set computed {unbalanced_refs}. Register and summary would "
+            "disagree downstream -- investigate before returning findings."
+        )
 
     return findings
 
