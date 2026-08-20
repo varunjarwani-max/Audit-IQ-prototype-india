@@ -21,53 +21,63 @@ def format_currency(val: float) -> str:
     return f"₹{float(val):,.2f}"
 
 
-def check_sentry_formatting(report_text: str) -> list:
+def check_sentry_integrity(report_text: str, formatted_findings: list) -> list:
     """
-    Detects currency figures in report_text that are NOT formatted with
-    exactly two decimal places. Backtracking-safe: captures the decimal
-    group explicitly instead of using a lookahead, so a well-formatted
-    number like ₹1,613,300.00 can never be partially matched.
-    """
-    pattern = r'₹\d{1,3}(?:,\d{3})*(\.\d+)?'
-    bad = []
-    for m in re.finditer(pattern, report_text):
-        decimal_part = m.group(1)
-        if decimal_part is None or len(decimal_part) != 3:  # must be ".XX"
-            bad.append(m.group(0))
-    return bad
+    Single unified Sentry pass. Extracts every currency figure in report_text
+    and checks, for each one:
+      (a) it is formatted with exactly two decimal places, and
+      (b) its numeric value matches a real amount that was actually sent
+          to the model in formatted_findings.
 
+    Comparing by numeric value (not string) means formatting drift can't
+    hide a hallucinated figure, and a genuinely correct figure that's
+    merely mis-formatted can't be falsely flagged as fabricated.
 
-def check_sentry_grounding(report_text: str, formatted_findings: list) -> list:
+    Returns a list of {"figure": str, "issue": str} problem dicts.
+    Empty list means the report is clean.
     """
-    Detects currency figures in report_text that do NOT correspond to any
-    real amount sent to the model. Catches fabricated/hallucinated figures
-    even when they are perfectly formatted (e.g. an invented ₹50,000
-    threshold that never appeared in the source data).
-    """
-    # Every legitimate amount the model was actually given
-    valid_amounts = set()
+    valid_values = set()
     for f in formatted_findings:
-        amt_str = f.get("formatted_amount")
-        if amt_str and amt_str != "N/A":
-            valid_amounts.add(amt_str)
-        # also allow debit/credit/book_value/cost variants if present
-        for key in ("formatted_debit", "formatted_credit",
+        for key in ("formatted_amount", "formatted_debit", "formatted_credit",
                     "formatted_book_value", "formatted_cost"):
             v = f.get(key)
-            if v:
-                valid_amounts.add(v)
+            if v and v != "N/A":
+                try:
+                    valid_values.add(round(float(v.replace("₹", "").replace(",", "")), 2))
+                except ValueError:
+                    continue
 
-    pattern = r'₹\d{1,3}(?:,\d{3})*\.\d{2}'
-    found_in_report = set(re.findall(pattern, report_text))
+    pattern = r'₹\d{1,3}(?:,\d{3})*(?:\.\d+)?'
+    problems = []
 
-    ungrounded = sorted(found_in_report - valid_amounts)
-    return ungrounded
+    for m in re.finditer(pattern, report_text):
+        raw = m.group(0)
+        numeric_str = raw.replace("₹", "").replace(",", "")
+
+        try:
+            val = round(float(numeric_str), 2)
+        except ValueError:
+            problems.append({"figure": raw, "issue": "unparseable"})
+            continue
+
+        has_two_decimals = "." in raw and len(raw.split(".")[-1]) == 2
+        is_grounded = val in valid_values
+
+        if not has_two_decimals:
+            problems.append({"figure": raw, "issue": "missing_decimals"})
+        if not is_grounded:
+            problems.append({"figure": raw, "issue": "not_in_source_data"})
+
+    return problems
 
 
-def generate_consolidated_master_report(all_domain_data: dict):
+def generate_consolidated_master_report(all_domain_data: dict, max_retries: int = 1):
     """
     Synthesizes the unified Master Report using Groq Llama 3.3.
-    Enforces strict decimal formatting rules and sufficient token limits to pass Sentry checks.
+    Enforces strict decimal formatting and source-grounding rules via the
+    unified Sentry integrity check. If the check fails, retries generation
+    up to max_retries times before returning the last attempt with warnings
+    attached (so app.py can decide whether to block/redact it).
     """
     client = get_groq_client()
 
@@ -101,9 +111,6 @@ def generate_consolidated_master_report(all_domain_data: dict):
                         "formatted_amount": format_currency(amt) if amt > 0 else "N/A",
                         "remediation": flag.get("remediation", "Review supporting documentation.")
                     }
-                    # Carry through any additional pre-formatted figures
-                    # (debit/credit/book_value/cost) so the grounding
-                    # check recognizes them as valid too.
                     for src_key, dst_key in [
                         ("debit", "formatted_debit"),
                         ("credit", "formatted_credit"),
@@ -119,9 +126,10 @@ def generate_consolidated_master_report(all_domain_data: dict):
 CRITICAL SENTRY VERIFICATION CONSTRAINTS:
 1. ALWAYS format every single currency figure with explicit two-decimal places (e.g. '₹60,000.00', NEVER write '₹60,000' or '₹60000').
 2. Every monetary figure in Section 1 (Executive Summary) MUST appear with identical decimal string formatting in Section 2 (Anomaly Register).
-3. NEVER invent, estimate, or state a rule threshold, limit, or benchmark figure unless it appears verbatim in the supplied JSON data below. If a rule's description does not include a numeric threshold, do not add one.
-4. Do NOT include any internal metadata columns (e.g. debug tokens, ground-truth tokens, QA fields) in the output tables — only the columns explicitly requested in the structure below.
+3. NEVER invent, estimate, or state a rule threshold, limit, or benchmark figure (e.g. a vendor billing cap) unless that exact number appears verbatim in the supplied JSON data below. If a rule's description contains no numeric threshold, do not add one — describe the finding qualitatively instead (e.g. "exceeds the applicable vendor billing threshold" with no number).
+4. Do NOT include any internal metadata columns (e.g. debug tokens, ground-truth tokens, QA fields, "GT Token") in the output tables — only the columns explicitly requested in the structure below.
 5. Do NOT cut off or truncate Markdown tables. Render all table rows completely through completion.
+6. Every currency figure you write MUST be copied character-for-character from a "formatted_amount", "formatted_debit", "formatted_credit", "formatted_book_value", or "formatted_cost" value in the JSON below. Do not compute, round, or restate a number from memory.
 """
 
     user_prompt = f"""Generate the Master Forensic Audit Report using this audited data:
@@ -138,63 +146,41 @@ Structure your output into 3 Sections:
 3. Recommended Substantive Audit Procedures (Numbered action plan).
 """
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        max_tokens=4096,
-        temperature=0.1
-    )
-
-    report_text = response.choices[0].message.content
-    finish_reason = response.choices[0].finish_reason
-
+    report_text = None
+    finish_reason = None
     sentry_warnings = []
+    integrity_issues = []
 
-    if finish_reason == "length":
-        sentry_warnings.append(
-            "Report generation was truncated by max_tokens before completion. "
-            "Increase max_tokens or shorten the input payload."
+    attempt = 0
+    while attempt <= max_retries:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=4096,
+            temperature=0.1
         )
 
-    unformatted = check_sentry_formatting(report_text)
-    if unformatted:
-        sentry_warnings.append(
-            f"Report contains monetary figures lacking standard decimal precision: {sorted(set(unformatted))}"
-        )
+        report_text = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
 
-    ungrounded = check_sentry_grounding(report_text, formatted_findings)
-    if ungrounded:
-        sentry_warnings.append(
-            f"Report contains monetary figures not present in the verified source data (possible hallucination): {ungrounded}"
-        )
+        sentry_warnings = []
+        if finish_reason == "length":
+            sentry_warnings.append(
+                "Report generation was truncated by max_tokens before completion. "
+                "Increase max_tokens or shorten the input payload."
+            )
+
+        integrity_issues = check_sentry_integrity(report_text, formatted_findings)
+        if integrity_issues:
+            sentry_warnings.append(f"Sentry integrity check failed: {integrity_issues}")
+
+        # Clean pass: stop retrying
+        if not integrity_issues and finish_reason != "length":
+            break
+
+        attempt += 1
 
     return report_text, sentry_warnings
-
-
-def generate_executive_memo(domain_name: str, findings: list):
-    """Generates domain-level executive summary memo."""
-    client = get_groq_client()
-    prompt = f"Provide a executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
-        temperature=0.2
-    )
-    return response.choices[0].message.content
-
-
-def generate_5c_finding_memo(record_data: dict, domain_name: str):
-    """Generates 5C audit memo (Condition, Criteria, Cause, Effect, Recommendation)."""
-    client = get_groq_client()
-    prompt = f"Generate a 5C audit note for row #{record_data['row_index']} in {domain_name}. Data: {json.dumps(record_data)}"
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
-        temperature=0.2
-    )
-    return response.choices[0].message.content
