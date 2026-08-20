@@ -67,28 +67,29 @@ def audit_transactions(
         (amt_arr < threshold_limit)
     )
 
-    # Rule 4: Multi-Payment Vendor Structuring within 7-Day Window
+    # Rule 4: Multi-Payment Vendor Structuring within 7-Day Window (O(n) monotonic sliding window)
     structuring_7d_indices = set()
     valid_dates_mask = date_series.notna().to_numpy()
     if valid_dates_mask.any():
         for vendor_name, group in working_df.groupby("_vendor"):
             if vendor_name and len(group) > 1:
                 valid_group = group.dropna(subset=["_date"]).sort_values("_date")
-                if len(valid_group) > 1:
-                    dates = valid_group["_date"].values
-                    amounts = valid_group["_amt"].values
-                    idxs = valid_group.index.values
+                n_grp = len(valid_group)
+                if n_grp > 1:
+                    dates = valid_group["_date"].to_numpy()
+                    amounts = valid_group["_amt"].to_numpy()
+                    idxs = valid_group.index.to_numpy()
+                    cum_amt = np.cumsum(np.insert(amounts, 0, 0.0))
                     
-                    for i in range(len(dates)):
-                        window_idxs = [idxs[i]]
-                        window_amt = amounts[i]
-                        for j in range(i + 1, len(dates)):
-                            diff_days = (dates[j] - dates[i]) / np.timedelta64(1, 'D')
-                            if diff_days <= 7:
-                                window_idxs.append(idxs[j])
-                                window_amt += amounts[j]
-                        if len(window_idxs) > 1 and window_amt >= threshold_limit:
-                            structuring_7d_indices.update(window_idxs)
+                    right = 0
+                    for left in range(n_grp):
+                        while right < n_grp and (dates[right] - dates[left]) <= np.timedelta64(7, 'D'):
+                            right += 1
+                        # Window is [left, right)
+                        if (right - left) > 1:
+                            window_amt = cum_amt[right] - cum_amt[left]
+                            if window_amt >= threshold_limit:
+                                structuring_7d_indices.update(idxs[left:right])
 
     # Fast Row Compilation using pre-computed arrays & itertuples
     for idx, row in enumerate(working_df.itertuples(index=False)):
@@ -200,7 +201,7 @@ def audit_aging(
         # Resolve to the maximum observed date in the workpaper or current date
         all_valid_dates = pd.concat([inv_date_series.dropna(), due_date_series.dropna(), pay_date_series.dropna()])
         if not all_valid_dates.empty:
-            ref_date = max(all_valid_dates.max(), pd.to_datetime(datetime.now()))
+            ref_date = all_valid_dates.max()
         else:
             ref_date = pd.to_datetime(datetime.now())
 
@@ -441,7 +442,7 @@ def audit_fixed_assets(
     else:
         valid_dates = date_series.dropna()
         if not valid_dates.empty:
-            ref_date = max(valid_dates.max(), pd.to_datetime(datetime.now()))
+            ref_date = valid_dates.max()
         else:
             ref_date = pd.to_datetime(datetime.now())
 

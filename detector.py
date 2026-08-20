@@ -156,21 +156,21 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
         primary_ratio = matched_primary_count / len(primary_fields)
         secondary_ratio = min(1.0, matched_sec_count / 2.0) if secondary_fields else 0.0
 
-        score = round((primary_ratio * 85.0) + (secondary_ratio * 15.0), 1)
+        score = int(round((primary_ratio * 85.0) + (secondary_ratio * 15.0)))
 
         # Domain critical penalty floors
         if cat == "general_ledger":
             has_dr_cr = ("debit" in matched_fields) or ("credit" in matched_fields)
             if not has_dr_cr:
-                score = min(score, 30.0)
+                score = min(score, 30)
         elif cat == "fixed_assets":
             has_asset_cost = ("asset_name" in matched_fields) or ("purchase_cost" in matched_fields)
             if not has_asset_cost:
-                score = min(score, 30.0)
+                score = min(score, 30)
         elif cat == "ar_ap_aging":
             has_due_status = ("due_date" in matched_fields) or ("invoice_status" in matched_fields)
             if not has_due_status:
-                score = min(score, 30.0)
+                score = min(score, 30)
 
         scores[cat] = score
         mappings[cat] = matched_fields

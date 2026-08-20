@@ -87,7 +87,8 @@ def run_benchmark(
     forced_category: str = None, 
     llm_samples: int = 2,
     api_key: str = None,
-    model: str = "openai/gpt-oss-20b"
+    model: str = "openai/gpt-oss-20b",
+    as_of_date: str = None
 ):
     print("=" * 80)
     print("🚀 AuditIQ Forensic Engine: Production Performance & Timing Benchmark")
@@ -124,16 +125,18 @@ def run_benchmark(
 
     # 3. Benchmark Vectorized Rule Execution across Full Unsliced DataFrame
     print(f"\n[3] Executing Deterministic Vectorized Rule Engine across FULL {n_rows:,} rows...")
+    if as_of_date:
+        print(f"    - Benchmark As-Of Date: {as_of_date}")
     t_start_rules = time.perf_counter()
 
     if cat == "transactions":
         findings = audit_transactions(df, col_map, threshold_limit=50000.0)
     elif cat == "ar_ap_aging":
-        findings = audit_aging(df, col_map, severe_overdue_days=90)
+        findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=as_of_date)
     elif cat == "general_ledger":
         findings = audit_general_ledger(df, col_map, period_end_days=4)
     elif cat == "fixed_assets":
-        findings = audit_fixed_assets(df, col_map)
+        findings = audit_fixed_assets(df, col_map, as_of_date=as_of_date)
     else:
         raise ValueError(f"Unknown category '{cat}'")
 
@@ -215,6 +218,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AuditIQ Performance & Timing Benchmark Harness")
     parser.add_argument("--file", type=str, default=None, help="Path to CSV or Excel file")
     parser.add_argument("--category", type=str, default=None, help="Force category")
+    parser.add_argument("--as-of-date", "-d", type=str, default=None, help="Benchmark reference date for AR/AP aging & fixed assets (e.g. 2024-10-31)")
     parser.add_argument("--llm-samples", type=int, default=2, help="Number of flagged records to draft 5C memos for")
     parser.add_argument("--api-key", type=str, default=None, help="Groq API Key")
     parser.add_argument("--model", type=str, default="openai/gpt-oss-20b", help="Model name")
@@ -225,5 +229,6 @@ if __name__ == "__main__":
         forced_category=args.category,
         llm_samples=args.llm_samples,
         api_key=args.api_key,
-        model=args.model
+        model=args.model,
+        as_of_date=args.as_of_date
     )

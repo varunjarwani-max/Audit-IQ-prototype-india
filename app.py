@@ -220,7 +220,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.markdown("#### ⚙️ **Audit Thresholds**")
+    st.markdown("#### ⚙️ **Audit Thresholds & Date**")
     st.session_state["txn_threshold"] = st.number_input(
         "Txn Sign-off Limit (₹ INR)",
         min_value=1000.0,
@@ -228,6 +228,13 @@ with st.sidebar:
         value=float(st.session_state.get("txn_threshold", 50000.0)),
         step=5000.0
     )
+    as_of_date_input = st.text_input(
+        "Benchmark As-Of Date (Optional)",
+        value=st.session_state.get("as_of_date_val", ""),
+        placeholder="e.g. 2024-10-31 (default: auto)",
+        help="Leave blank to automatically reference the dataset's max date."
+    )
+    st.session_state["as_of_date_val"] = as_of_date_input.strip() if as_of_date_input else None
 
 
 # ---------------------------------------------------------
@@ -336,11 +343,11 @@ t_start = time.perf_counter()
 if active_category == "transactions":
     all_findings = audit_transactions(current_df, effective_col_map, threshold_limit=st.session_state["txn_threshold"])
 elif active_category == "ar_ap_aging":
-    all_findings = audit_aging(current_df, effective_col_map, severe_overdue_days=90)
+    all_findings = audit_aging(current_df, effective_col_map, severe_overdue_days=90, as_of_date=st.session_state.get("as_of_date_val"))
 elif active_category == "general_ledger":
     all_findings = audit_general_ledger(current_df, effective_col_map, period_end_days=4)
 elif active_category == "fixed_assets":
-    all_findings = audit_fixed_assets(current_df, effective_col_map)
+    all_findings = audit_fixed_assets(current_df, effective_col_map, as_of_date=st.session_state.get("as_of_date_val"))
 else:
     all_findings = []
 
