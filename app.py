@@ -1,243 +1,186 @@
 """
-AuditIQ - Data Segregation & Routing Layer
-Pure Python & Streamlit Application
-
-Run locally with:
-    streamlit run app.py
+groq_advisor.py - AI Report & Memo Synthesis for AuditIQ
 """
 
-import streamlit as st
+import os
+import re
+import json
+from groq import Groq
 
-# Must strictly be the very first Streamlit command executed
-st.set_page_config(
-    page_title="AuditIQ - Data Segregation & Routing",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-import pandas as pd
-import numpy as np
-import time
-from datetime import datetime
+def get_groq_client():
+    """Initializes and returns the Groq API client."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY environment variable is missing.")
+    return Groq(api_key=api_key)
 
-# Local helper modules imported AFTER set_page_config
-from detector import classify_columns, ALIAS_DEFINITIONS
-from rules_engine import audit_transactions, audit_aging, audit_general_ledger, audit_fixed_assets
-from groq_advisor import generate_executive_memo, generate_5c_finding_memo, generate_consolidated_master_report
-from sample_data import SAMPLE_DATASETS
 
-# ---------------------------------------------------------
-# Clean Minimalism Custom CSS
-# ---------------------------------------------------------
-st.markdown("""
-<style>
-    .stApp, .stApp p, .stApp span, .stApp label, 
-    .stMarkdown, h1, h2, h3, h4, h5, h6,
-    [data-testid="stSidebar"] *,
-    .stDataFrame, .stTable {
-        color: #0F172A !important;
-    }
-    .stApp {
-        background-color: #F8FAFC !important;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    section[data-testid="stSidebar"] {
-        background-color: #FFFFFF !important;
-        border-right: 1px solid #E2E8F0 !important;
-    }
-    .metric-card {
-        background-color: #FFFFFF;
-        border: 1px solid #E2E8F0;
-        border-radius: 12px;
-        padding: 16px 20px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.02);
-        margin-bottom: 12px;
-    }
-    .metric-label {
-        font-size: 11px;
-        font-weight: 700;
-        text-transform: uppercase;
-        color: #64748B !important;
-        letter-spacing: 0.05em;
-        margin-bottom: 4px;
-    }
-    .metric-value {
-        font-size: 20px;
-        font-weight: 800;
-        color: #0F172A !important;
-    }
-    .finding-box {
-        background-color: #FFFFFF;
-        border: 1px solid #E2E8F0;
-        border-radius: 10px;
-        padding: 16px;
-        margin-bottom: 12px;
-    }
-    .badge-critical { background-color: #FEE2E2; color: #991B1B !important; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
-    .badge-high { background-color: #FEF3C7; color: #92400E !important; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
-    .sentry-alert { background-color: #FEF2F2; border-left: 4px solid #EF4444; padding: 12px; margin-bottom: 16px; border-radius: 4px; color: #991B1B !important; font-weight: 600; }
-</style>
-""", unsafe_allow_html=True)
+def format_currency(val: float) -> str:
+    """Guarantees strict two-decimal currency formatting required for Sentry verification."""
+    return f"₹{float(val):,.2f}"
 
-# ---------------------------------------------------------
-# Session State Initialization
-# ---------------------------------------------------------
-if "batch_index" not in st.session_state: st.session_state["batch_index"] = 0
-if "working_df" not in st.session_state: st.session_state["working_df"] = SAMPLE_DATASETS["transactions"]["df"].copy()
-if "override_category" not in st.session_state: st.session_state["override_category"] = None
-if "custom_col_map" not in st.session_state: st.session_state["custom_col_map"] = {}
-if "individual_memos" not in st.session_state: st.session_state["individual_memos"] = {}
-if "multi_file_data" not in st.session_state: st.session_state["multi_file_data"] = {}
-if "active_file_name" not in st.session_state: st.session_state["active_file_name"] = None
 
-# ---------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------
-with st.sidebar:
-    st.markdown("### 🛡️ **AuditIQ**")
-    st.caption("Data Segregation & Anomaly Routing Engine")
+def check_sentry_integrity(report_text: str, formatted_findings: list) -> list:
+    """
+    Single unified Sentry pass. Extracts every currency figure in report_text
+    and checks, for each one:
+      (a) it is formatted with exactly two decimal places, and
+      (b) its numeric value matches a real amount that was actually sent
+          to the model in formatted_findings.
 
-# ---------------------------------------------------------
-# Main App Header & Multi-File Ingestion
-# ---------------------------------------------------------
-st.title("AuditIQ Data Segregation Layer")
-st.markdown("Ingest multiple financial files simultaneously. AuditIQ will auto-route each to its respective engine and generate a unified Master Report.")
+    Comparing by numeric value (not string) means formatting drift can't
+    hide a hallucinated figure, and a genuinely correct figure that's
+    merely mis-formatted can't be falsely flagged as fabricated.
 
-uploaded_files = st.file_uploader(
-    "Upload Financial Data Files (CSV or Excel)",
-    type=["csv", "xlsx", "xls"],
-    accept_multiple_files=True
-)
+    Returns a list of {"figure": str, "issue": str} problem dicts.
+    Empty list means the report is clean.
+    """
+    valid_values = set()
+    for f in formatted_findings:
+        for key in ("formatted_amount", "formatted_debit", "formatted_credit",
+                    "formatted_book_value", "formatted_cost"):
+            v = f.get(key)
+            if v and v != "N/A":
+                try:
+                    valid_values.add(round(float(v.replace("₹", "").replace(",", "")), 2))
+                except ValueError:
+                    continue
 
-if uploaded_files:
-    if len(uploaded_files) != len(st.session_state["multi_file_data"]):
-        st.session_state["multi_file_data"] = {}
-        for file in uploaded_files:
-            df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
-            classification = classify_columns(list(df.columns))
-            category = classification["category"]
-            if category == "ambiguous": category = classification["raw_best_category"]
-            
-            col_map = classification["matched_columns"]
-            findings = []
-            if category == "transactions": findings = audit_transactions(df, col_map)
-            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=None)
-            elif category == "general_ledger": findings = audit_general_ledger(df, col_map, period_end_days=4)
-            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=None)
-            
-            st.session_state["multi_file_data"][file.name] = {
-                "df": df,
-                "category": category,
-                "findings": findings,
-                "classification": classification
-            }
-        
-        st.session_state["active_file_name"] = uploaded_files[0].name
-        st.session_state["working_df"] = st.session_state["multi_file_data"][uploaded_files[0].name]["df"]
-        st.session_state["override_category"] = None
-        st.session_state["custom_col_map"] = {}
-        st.rerun()
+    pattern = r'₹\d{1,3}(?:,\d{3})*(?:\.\d+)?'
+    problems = []
 
-# ---------------------------------------------------------
-# Consolidated Dashboard & Master Report Generation
-# ---------------------------------------------------------
-if st.session_state["multi_file_data"]:
-    st.markdown("---")
-    st.markdown("### 🌐 Consolidated Multi-Domain Dashboard")
-    
-    total_files = len(st.session_state["multi_file_data"])
-    total_anomalies = sum(len([f for f in data["findings"] if f["status"] == "FLAGGED"]) for data in st.session_state["multi_file_data"].values())
-    
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Domains Analyzed", total_files)
-    c2.metric("Total Rows Processed", sum(len(data["df"]) for data in st.session_state["multi_file_data"].values()))
-    c3.metric("Total Flagged Anomalies", total_anomalies)
+    for m in re.finditer(pattern, report_text):
+        raw = m.group(0)
+        numeric_str = raw.replace("₹", "").replace(",", "")
 
-    if st.button("✨ Generate Unified Master Report", type="primary", use_container_width=True):
-        with st.spinner("Calculating exact metrics and synthesizing dossier..."):
-            master_memo, sentry_warnings = generate_consolidated_master_report(
-                all_domain_data=st.session_state["multi_file_data"]
+        try:
+            val = round(float(numeric_str), 2)
+        except ValueError:
+            problems.append({"figure": raw, "issue": "unparseable"})
+            continue
+
+        has_two_decimals = "." in raw and len(raw.split(".")[-1]) == 2
+        is_grounded = val in valid_values
+
+        if not has_two_decimals:
+            problems.append({"figure": raw, "issue": "missing_decimals"})
+        if not is_grounded:
+            problems.append({"figure": raw, "issue": "not_in_source_data"})
+
+    return problems
+
+
+def generate_consolidated_master_report(all_domain_data: dict, max_retries: int = 1):
+    """
+    Synthesizes the unified Master Report using Groq Llama 3.3.
+    Enforces strict decimal formatting and source-grounding rules via the
+    unified Sentry integrity check. If the check fails, retries generation
+    up to max_retries times before returning the last attempt with warnings
+    attached (so app.py can decide whether to block/redact it).
+    """
+    client = get_groq_client()
+
+    # Pre-process findings to guarantee exact numeric matching
+    summary_stats = []
+    formatted_findings = []
+
+    for file_name, file_info in all_domain_data.items():
+        domain = file_info.get("category", "unknown")
+        df = file_info.get("df")
+        findings = file_info.get("findings", [])
+
+        flagged_count = sum(1 for f in findings if f.get("status") == "FLAGGED")
+        summary_stats.append({
+            "file": file_name,
+            "domain": domain,
+            "rows": len(df) if df is not None else 0,
+            "flagged_anomalies": flagged_count
+        })
+
+        for item in findings:
+            if item.get("status") == "FLAGGED":
+                for flag in item.get("flags", []):
+                    amt = flag.get("amount", 0.0)
+                    entry = {
+                        "domain": domain,
+                        "row_index": item.get("row_index"),
+                        "rule_code": flag.get("rule_code"),
+                        "severity": flag.get("severity"),
+                        "description": flag.get("description"),
+                        "formatted_amount": format_currency(amt) if amt > 0 else "N/A",
+                        "remediation": flag.get("remediation", "Review supporting documentation.")
+                    }
+                    for src_key, dst_key in [
+                        ("debit", "formatted_debit"),
+                        ("credit", "formatted_credit"),
+                        ("book_value", "formatted_book_value"),
+                        ("cost", "formatted_cost"),
+                    ]:
+                        if src_key in flag:
+                            entry[dst_key] = format_currency(flag[src_key])
+                    formatted_findings.append(entry)
+
+    system_prompt = """You are an Executive Forensic Auditor generating an Audit Master Dossier.
+
+CRITICAL SENTRY VERIFICATION CONSTRAINTS:
+1. ALWAYS format every single currency figure with explicit two-decimal places (e.g. '₹60,000.00', NEVER write '₹60,000' or '₹60000').
+2. Every monetary figure in Section 1 (Executive Summary) MUST appear with identical decimal string formatting in Section 2 (Anomaly Register).
+3. NEVER invent, estimate, or state a rule threshold, limit, or benchmark figure (e.g. a vendor billing cap) unless that exact number appears verbatim in the supplied JSON data below. If a rule's description contains no numeric threshold, do not add one — describe the finding qualitatively instead (e.g. "exceeds the applicable vendor billing threshold" with no number).
+4. Do NOT include any internal metadata columns (e.g. debug tokens, ground-truth tokens, QA fields, "GT Token") in the output tables — only the columns explicitly requested in the structure below.
+5. Do NOT cut off or truncate Markdown tables. Render all table rows completely through completion.
+6. Every currency figure you write MUST be copied character-for-character from a "formatted_amount", "formatted_debit", "formatted_credit", "formatted_book_value", or "formatted_cost" value in the JSON below. Do not compute, round, or restate a number from memory.
+"""
+
+    user_prompt = f"""Generate the Master Forensic Audit Report using this audited data:
+
+Domain Summary:
+{json.dumps(summary_stats, indent=2)}
+
+Flagged Anomalies Detail:
+{json.dumps(formatted_findings, indent=2)}
+
+Structure your output into 3 Sections:
+1. Executive Summary & Verified Exposure (Include combined counts, file metrics table, and exact exposure bullets with 2 decimals).
+2. Multi-Domain Anomaly Register (Render Markdown tables categorized by domain: Fixed Assets, General Ledger, Accounts Receivable / Accounts Payable Aging, and Transactions. Columns: Row, Rule, Severity, Finding, Detected Value, Remediation — no other columns).
+3. Recommended Substantive Audit Procedures (Numbered action plan).
+"""
+
+    report_text = None
+    finish_reason = None
+    sentry_warnings = []
+    integrity_issues = []
+
+    attempt = 0
+    while attempt <= max_retries:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=4096,
+            temperature=0.1
+        )
+
+        report_text = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
+
+        sentry_warnings = []
+        if finish_reason == "length":
+            sentry_warnings.append(
+                "Report generation was truncated by max_tokens before completion. "
+                "Increase max_tokens or shorten the input payload."
             )
-            
-            if sentry_warnings:
-                st.markdown("### ⚠️ Sentry Verification Alerts")
-                for warning in sentry_warnings:
-                    st.markdown(f"<div class='sentry-alert'><b>{warning}</b></div>", unsafe_allow_html=True)
-            
-            st.markdown("#### 📑 Master Executive Dossier")
-            st.markdown(master_memo)
-            st.download_button("📥 Download Master Report", data=master_memo, file_name="AuditIQ_Master_Report.md", mime="text/markdown")
 
-    st.markdown("---")
-    
-    selected_file = st.selectbox("Select File for Interactive Deep Dive:", options=list(st.session_state["multi_file_data"].keys()))
-    if selected_file != st.session_state["active_file_name"]:
-        st.session_state["active_file_name"] = selected_file
-        st.session_state["working_df"] = st.session_state["multi_file_data"][selected_file]["df"]
-        st.session_state["batch_index"] = 0
-        st.rerun()
+        integrity_issues = check_sentry_integrity(report_text, formatted_findings)
+        if integrity_issues:
+            sentry_warnings.append(f"Sentry integrity check failed: {integrity_issues}")
 
-    current_df = st.session_state["working_df"]
-    active_data = st.session_state["multi_file_data"][st.session_state["active_file_name"]]
-    active_category = active_data["category"]
-    confidence = active_data["classification"]["confidence"]
-    effective_col_map = {**active_data["classification"]["matched_columns"], **st.session_state["custom_col_map"]}
-    all_findings = active_data["findings"]
+        # Clean pass: stop retrying
+        if not integrity_issues and finish_reason != "length":
+            break
 
-    total_records = len(current_df)
-    total_flagged_all = sum(1 for f in all_findings if f["status"] == "FLAGGED")
-    
-    BATCH_SIZE = 5
-    total_batches = max(1, (total_records + BATCH_SIZE - 1) // BATCH_SIZE)
-    current_batch_idx = min(st.session_state["batch_index"], total_batches - 1)
-    batch_start_idx = current_batch_idx * BATCH_SIZE
-    batch_end_idx = min((current_batch_idx + 1) * BATCH_SIZE, total_records)
-    batch_df = current_df.iloc[batch_start_idx:batch_end_idx].copy()
-    batch_findings = all_findings[batch_start_idx:batch_end_idx]
-    batch_flagged_count = sum(1 for f in batch_findings if f["status"] == "FLAGGED")
+        attempt += 1
 
-    st.markdown(f"### 🔍 Deep Dive: `{st.session_state['active_file_name']}` ({ALIAS_DEFINITIONS[active_category]['display_name']})")
-    
-    edited_batch_df = st.data_editor(batch_df, use_container_width=True, num_rows="dynamic", key=f"editor_batch_{current_batch_idx}")
-    if not edited_batch_df.equals(batch_df):
-        st.session_state["working_df"].iloc[batch_start_idx:batch_end_idx] = edited_batch_df
-        st.session_state["multi_file_data"] = {}
-        st.rerun()
-
-    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
-    with nav_col1:
-        if st.button("⬅️ Previous 5", disabled=(current_batch_idx == 0), use_container_width=True):
-            st.session_state["batch_index"] = max(0, current_batch_idx - 1); st.rerun()
-    with nav_col2:
-        st.markdown(f"<div style='text-align: center; padding-top: 6px; font-size: 13px; font-weight: 600;'>Batch {current_batch_idx + 1} of {total_batches}</div>", unsafe_allow_html=True)
-    with nav_col3:
-        if st.button("Next 5 ➡️", disabled=(current_batch_idx >= total_batches - 1), use_container_width=True):
-            st.session_state["batch_index"] = min(total_batches - 1, current_batch_idx + 1); st.rerun()
-
-    st.divider()
-    if batch_flagged_count == 0:
-        st.success("✅ **Batch Slice Cleared**: No compliance violations detected in this 5-record window.")
-    else:
-        for item in batch_findings:
-            if item["status"] == "FLAGGED":
-                global_row_num = item["row_index"]
-                st.markdown(f"#### 🚩 Record #{global_row_num}")
-                for f in item["flags"]:
-                    sev = f["severity"]
-                    badge = "badge-critical" if sev == "CRITICAL" else "badge-high"
-                    st.markdown(f"""
-                    <div class="finding-box">
-                        <span class="{badge}">{sev}</span> <b>{f['rule_code']}</b>: {f['rule_name']}<br>
-                        <span style="font-size: 13px; color: #64748B;">{f['description']}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                memo_key = f"memo_row_{global_row_num}"
-                if memo_key in st.session_state["individual_memos"]:
-                    st.markdown(st.session_state["individual_memos"][memo_key])
-                else:
-                    if st.button(f"Generate 5C Note for Row #{global_row_num}", key=f"btn_5c_{global_row_num}"):
-                        note = generate_5c_finding_memo({"row_index": global_row_num, "data": current_df.iloc[global_row_num - 1].to_dict(), "flags": item["flags"]}, ALIAS_DEFINITIONS[active_category]['display_name'])
-                        st.session_state["individual_memos"][memo_key] = note
-                        st.rerun()
+    return report_text, sentry_warnings
