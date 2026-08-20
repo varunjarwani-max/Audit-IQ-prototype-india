@@ -4,6 +4,7 @@ Architecture:
 - Pre-calculates exact row counts and tokenizes rupee amounts.
 - Unpacks nested rule engine flags ('flags' array) to extract granular rule codes.
 - Verifies post-generation consistency with strict Sentry guardrails.
+- Exports: generate_consolidated_master_report, generate_executive_memo, generate_5c_finding_memo
 """
 
 import json
@@ -35,6 +36,7 @@ GT_TOKEN_PATTERN = re.compile(r"\[\[GT_\d+\]\]")
 
 
 def _get_groq_api_keys() -> List[str]:
+    """Safely retrieves API keys from st.secrets at runtime."""
     keys = []
     for i in range(1, 6):
         try:
@@ -47,6 +49,21 @@ def _get_groq_api_keys() -> List[str]:
 
 def _valid_keys(api_keys: List[str]) -> List[str]:
     return [k.strip() for k in api_keys if k and k.strip() and not k.strip().endswith("_PLACEHOLDER")]
+
+
+def _is_flagged_finding(f: Dict[str, Any]) -> bool:
+    """Flexible check for flagged findings across various schema conventions."""
+    if not isinstance(f, dict):
+        return False
+    
+    # Check if nested flags exist and contain elements
+    if isinstance(f.get("flags"), list) and len(f["flags"]) > 0:
+        return True
+        
+    status = f.get("status")
+    if status is None:
+        return True
+    return str(status).upper() in ("FLAGGED", "TRUE", "HIGH", "CRITICAL", "YES", "ANOMALY")
 
 
 def _unpack_nested_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -92,15 +109,17 @@ def _call_groq_with_retry(
     max_backoff_rounds: int = 3,
     allow_fallback: bool = True
 ) -> str:
+    """Executes completion with key rotation, backoff, and model fallback."""
     api_keys = _get_groq_api_keys()
     usable_keys = _valid_keys(api_keys)
 
     if not usable_keys:
-        msg = "No usable GROQ_API_KEY_* secret configured."
+        msg = "No usable GROQ_API_KEY_* secret is configured in st.secrets."
         logger.error(msg)
         raise RuntimeError(msg)
 
     last_exception = None
+
     for round_num in range(max_backoff_rounds):
         for cleaned_key in usable_keys:
             try:
@@ -115,25 +134,52 @@ def _call_groq_with_retry(
                     return completion.choices[0].message.content
                 else:
                     url = "https://api.groq.com/openai/v1/chat/completions"
-                    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {cleaned_key}"}
-                    payload = json.dumps({"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}).encode("utf-8")
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {cleaned_key}"
+                    }
+                    payload = json.dumps({
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens
+                    }).encode("utf-8")
+
                     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                     with urllib.request.urlopen(req, timeout=35) as response:
                         result = json.loads(response.read().decode("utf-8"))
                         return result["choices"][0]["message"]["content"]
+
             except Exception as e:
                 last_exception = e
+                key_suffix = cleaned_key[-4:] if len(cleaned_key) >= 4 else "****"
+                logger.warning(
+                    "Groq call failed (model=%s, key=***%s, round=%d): %s",
+                    model, key_suffix, round_num, e
+                )
                 continue
+
         if round_num < max_backoff_rounds - 1:
             time.sleep((2 ** (round_num + 1)) + random.uniform(0.5, 1.5))
 
     if allow_fallback and model == "openai/gpt-oss-20b":
-        return _call_groq_with_retry(messages, model="llama-3.3-70b-versatile", max_tokens=max_tokens, temperature=temperature, max_backoff_rounds=1, allow_fallback=False)
+        logger.warning("Primary model exhausted retries, falling back to llama-3.3-70b-versatile.")
+        return _call_groq_with_retry(
+            messages=messages,
+            model="llama-3.3-70b-versatile",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            max_backoff_rounds=1,
+            allow_fallback=False
+        )
 
-    raise RuntimeError(f"Groq generation failed: {last_exception}")
+    final_msg = f"Groq generation failed with model '{model}': {last_exception}"
+    logger.error(final_msg)
+    raise RuntimeError(final_msg)
 
 
 def _tokenize_currency(obj: Any, registry: Dict[str, str], value_to_token: Dict[str, str]) -> Any:
+    """Replaces rupee figures with tokenized values like [[GT_1]]."""
     def token_for(value: str) -> str:
         if value not in value_to_token:
             token = f"[[GT_{len(registry) + 1}]]"
@@ -151,18 +197,28 @@ def _tokenize_currency(obj: Any, registry: Dict[str, str], value_to_token: Dict[
 
 
 def _verify_no_unverified_currency(report_text: str, known_values: set) -> List[str]:
+    """Sentry guardrail checking for unverified monetary values in the output text."""
     problems = []
-    leftover = GT_TOKEN_PATTERN.findall(report_text)
-    if leftover:
-        problems.append(f"Sentry Alert: {len(leftover)} ground-truth tokens were not substituted.")
-    found = set(CURRENCY_PATTERN.findall(report_text))
-    unverified = found - known_values
+    leftover_tokens = GT_TOKEN_PATTERN.findall(report_text)
+    if leftover_tokens:
+        problems.append(
+            f"Sentry Alert: {len(leftover_tokens)} ground-truth token(s) were not substituted "
+            f"back into real figures (e.g. {leftover_tokens[0]})."
+        )
+
+    found_values = set(CURRENCY_PATTERN.findall(report_text))
+    unverified = found_values - known_values
     if unverified:
-        problems.append(f"Sentry Alert: report contains unverified rupee amounts: {sorted(unverified)}")
+        problems.append(
+            f"Sentry Alert: report contains {len(unverified)} rupee amount(s) with no matching "
+            f"ground-truth source: {sorted(unverified)}"
+        )
+
     return problems
 
 
 def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Synthesizes findings across multiple datasets into a consolidated dossier."""
     total_files = len(all_domain_data)
     exact_total_rows = 0
     exact_flagged_count = 0
@@ -176,7 +232,6 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
         raw_findings = data.get("findings", [])
         unpacked_findings = _unpack_nested_findings(raw_findings)
         
-        # Unique rows flagged
         flagged_rows = len({f["row"] for f in unpacked_findings if f.get("row") is not None})
         exact_flagged_count += flagged_rows
 
@@ -192,7 +247,7 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
     tokenized_domain_findings = []
 
     for filename, data in all_domain_data.items():
-        unpacked = _unpack_nested_findings(data.get("findings", []))[:8]  # Limit to top 8 unpacked findings
+        unpacked = _unpack_nested_findings(data.get("findings", []))[:8]
         tokenized_subset = _tokenize_currency(unpacked, token_registry, value_to_token)
         tokenized_domain_findings.append((filename, tokenized_subset))
 
@@ -202,16 +257,19 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
     prompt = f"""
 You are an elite Senior Forensic Audit Partner. Synthesize this cross-domain audit telemetry into a Master Executive Dossier.
 
-STRICT NUMERIC CONSTRAINTS (Calculated by Python Engine):
+STRICT NUMERIC CONSTRAINTS (Calculated by Python Engine - DO NOT ALTER OR RECALCULATE):
 - Exact Files Processed: {total_files}
 - Exact Combined Row Count Across All Files: {exact_total_rows}
 - Exact Total Flagged Anomalies: {exact_flagged_count}
 - Domain Breakdown Data: {json.dumps(domain_breakdown)}
 
 GROUND-TRUTH RUPEE TOKEN GLOSSARY:
-{token_glossary if token_glossary else "(no rupee figures)"}
+Every rupee figure below has been computed in Python and replaced with a token like [[GT_1]].
+Wherever you state a rupee amount, insert the matching token EXACTLY as written.
+{token_glossary if token_glossary else "(no rupee figures in this batch)"}
 
 ITEMIZED DOMAIN FINDINGS TELEMETRY:
+Below are itemized audit findings per file. Cite specific rule codes (e.g., TXN-001, GL-002, AST-001), row indexes, and vendor names directly in your report.
 """
     for filename, tokenized_subset in tokenized_domain_findings:
         prompt += f"\nFile: {filename}\n{json.dumps(tokenized_subset, default=str)}\n"
@@ -231,7 +289,14 @@ STRUCTURE:
 """
 
     messages = [
-        {"role": "system", "content": "You are a Forensic Auditor. Cite specific rule codes (e.g. TXN-004, GL-002, AST-001) and vendor/row details from the telemetry."},
+        {
+            "role": "system",
+            "content": (
+                "You are a Forensic Auditor. You cite specific itemized telemetry (rule codes, vendors, vouchers) "
+                "from the findings provided. You never perform arithmetic and never type rupee digits yourself. "
+                "Every monetary figure must be inserted as its exact [[GT_n]] token, copied verbatim from the glossary."
+            )
+        },
         {"role": "user", "content": prompt}
     ]
 
@@ -247,4 +312,60 @@ STRUCTURE:
         if summary_header in final_report:
             final_report = final_report.replace(summary_header, summary_header + "\n" + verified_bullets)
 
+    blocking_problems = [
+        w for w in sentry_warnings 
+        if w.startswith("Sentry Alert: report contains") or "not substituted" in w
+    ]
+    if blocking_problems:
+        logger.error("Blocking fabricated/unverified report: %s", blocking_problems)
+        raise RuntimeError(
+            "Report generation produced unverified rupee figures and was blocked before display. "
+            + " | ".join(blocking_problems)
+        )
+
     return final_report, sentry_warnings
+
+
+def generate_executive_memo(
+    category: str, 
+    findings: List[Dict[str, Any]], 
+    batch_df_records: List[Dict[str, Any]], 
+    confidence: float
+) -> str:
+    """Generates a formal 5C Internal Audit Workpaper Memo for a specific category batch."""
+    unpacked_findings = _unpack_nested_findings(findings)
+    total_records = len(batch_df_records) if batch_df_records else len(findings)
+    flagged_records = len(unpacked_findings)
+
+    prompt = f"""
+Draft a formal 5C Audit Workpaper Memo for the domain '{category}'.
+Batch Evaluated: {total_records} records | Flagged Anomalies: {flagged_records}
+
+Sample Telemetry Findings:
+{json.dumps(unpacked_findings[:5], indent=2, default=str)}
+
+STRUCTURE REQUIREMENT:
+- Condition: What was observed in the data telemetry.
+- Criteria: Applicable accounting standard or control benchmark.
+- Cause: Root driver of the variance.
+- Effect: Financial and operational risk exposure.
+- Corrective Action: Audit recommendations for remediation.
+"""
+    messages = [
+        {"role": "system", "content": "You are a CA Forensic Auditor drafting a formal 5C Audit Memo."},
+        {"role": "user", "content": prompt}
+    ]
+    return _call_groq_with_retry(messages, max_tokens=1500, temperature=0.1)
+
+
+def generate_5c_finding_memo(record: Dict[str, Any], category: str) -> str:
+    """Generates a dedicated 5C workpaper memo for a single flagged record."""
+    prompt = f"""
+Draft a concise 5C Workpaper Note for this individual flagged record in category '{category}':
+{json.dumps(record, indent=2, default=str)}
+"""
+    messages = [
+        {"role": "system", "content": "You are a CA Forensic Auditor drafting an itemized finding note."},
+        {"role": "user", "content": prompt}
+    ]
+    return _call_groq_with_retry(messages, max_tokens=600, temperature=0.0)
