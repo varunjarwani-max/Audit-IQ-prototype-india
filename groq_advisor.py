@@ -6,7 +6,7 @@ Architecture Note (Privacy & Deployment):
 - This advisor module provides LLM-assisted drafting of formal 5C Internal Audit Workpapers.
 - In this environment, it routes to Groq Cloud API for ultra-low latency validation; in air-gapped CA production,
   the endpoint can be seamlessly toggled to an on-premise inference server (e.g. Ollama or vLLM at localhost:11434).
-- Includes exponential backoff retry logic to handle free-tier TPM / RPM 429 throttling gracefully.
+- Includes exponential backoff retry logic and automatic model fallback to handle rate limits gracefully.
 """
 
 import json
@@ -22,10 +22,10 @@ except ImportError:
     import urllib.request
     import urllib.error
 
-
+# Kept strictly to the unified 20B model for synthesis/generation, and 8B for fallback/speed tests.
 SUPPORTED_MODELS = [
     {"id": "openai/gpt-oss-20b", "name": "OpenAI GPT-OSS 20B (16GB On-Premise Target)"},
-    {"id": "llama-3.1-8b-instant", "name": "Llama 3.1 8B Instant (Edge/Local Low-Footprint)"}
+    {"id": "llama-3.1-8b-instant", "name": "Llama 3.1 8B Instant (Edge/Local Low-Footprint Fallback)"}
 ]
 
 
@@ -35,10 +35,12 @@ def _call_groq_with_retry(
     messages: List[Dict[str, str]],
     max_tokens: int = 1500,
     temperature: float = 0.2,
-    max_retries: int = 4
+    max_retries: int = 4,
+    allow_fallback: bool = True
 ) -> str:
     """
     Executes a chat completion call with exponential backoff and jitter to survive HTTP 429 rate-limiting.
+    Includes an automatic fallback to llama-3.1-8b-instant if the primary gpt-oss-20b model fully fails.
     """
     cleaned_key = api_key.strip()
     last_exception = None
@@ -89,12 +91,24 @@ def _call_groq_with_retry(
                 continue
             else:
                 break
+    
+    # Fallback Logic: If the 20B target fails all retries, instantly drop to the 8B fallback.
+    if allow_fallback and model == "openai/gpt-oss-20b":
+        return _call_groq_with_retry(
+            api_key=api_key,
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            max_retries=2, # Shorter retry loop for the fallback
+            allow_fallback=False
+        )
 
     raise RuntimeError(f"Groq generation failed with model '{model}' after {max_retries} attempts: {str(last_exception)}")
 
 
 def test_groq_key(api_key: str, model: str = "llama-3.1-8b-instant") -> Dict[str, Any]:
-    """Tests the Groq API key with a fast ping call."""
+    """Tests the Groq API key with a fast ping call using the lightest model."""
     if not api_key or not api_key.strip():
         return {"success": False, "message": "No API key provided."}
 
@@ -103,7 +117,7 @@ def test_groq_key(api_key: str, model: str = "llama-3.1-8b-instant") -> Dict[str
             {"role": "system", "content": "You are a ping test assistant. Respond strictly with 'OK'."},
             {"role": "user", "content": "Ping"}
         ]
-        _call_groq_with_retry(api_key, model, messages, max_tokens=10, max_retries=2)
+        _call_groq_with_retry(api_key, model, messages, max_tokens=10, max_retries=2, allow_fallback=False)
         return {"success": True, "message": f"Connection verified successfully using {model}!"}
     except Exception as e:
         return {"success": False, "message": f"Groq verification failed: {str(e)}"}
@@ -111,11 +125,11 @@ def test_groq_key(api_key: str, model: str = "llama-3.1-8b-instant") -> Dict[str
 
 def generate_executive_memo(
     api_key: str,
-    model: str,
     category: str,
     findings: List[Dict[str, Any]],
     batch_df_records: List[Dict[str, Any]],
-    confidence: float
+    confidence: float,
+    model: str = "openai/gpt-oss-20b"
 ) -> str:
     """
     Generates a formal 5C Internal Audit Workpaper Memo across the batch findings.
@@ -197,9 +211,9 @@ Provide actionable, itemized recommendations for management and workpaper sign-o
 
 def generate_5c_finding_memo(
     api_key: str,
-    model: str,
     record: Dict[str, Any],
-    category: str
+    category: str,
+    model: str = "openai/gpt-oss-20b"
 ) -> str:
     """
     Generates a dedicated, single-record 5C workpaper memo for an individual flagged transaction.
@@ -231,8 +245,8 @@ STRUCTURE:
 
 def generate_consolidated_master_report(
     api_key: str,
-    model: str,
-    all_domain_data: Dict[str, Any]
+    all_domain_data: Dict[str, Any],
+    model: str = "openai/gpt-oss-20b"
 ) -> str:
     """
     Synthesizes findings across multiple datasets (Transactions, GL, AR/AP, Fixed Assets) 
@@ -285,5 +299,5 @@ Maintain a strictly professional, objective, and authoritative forensic accounti
         {"role": "user", "content": prompt}
     ]
 
-    # Leverages existing _call_groq_with_retry for rate limits and connection issues
+    # Leverages existing _call_groq_with_retry for rate limits, connection issues, and automatic fallback
     return _call_groq_with_retry(api_key, model, messages, max_tokens=2000, temperature=0.2)
