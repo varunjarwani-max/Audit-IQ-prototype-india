@@ -11,15 +11,14 @@ def format_currency(val: float) -> str:
     return f"₹{float(val):,.2f}"
 
 
-def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: float = 50000.0) -> list:
+def audit_transactions(df: pd.DataFrame, col_map: dict = None) -> list:
     """
-    Audits transactions dataset for:
-    - TXN-001: Missing approval
-    - TXN-002: Exact round figure disbursement > threshold
-    - TXN-004: 7-day rolling split-invoicing aggregate > threshold
+    Audits transactions dataset without threshold limits for:
+    - TXN-001: Missing approval sign-off
+    - TXN-002: Exact round figure disbursement
+    - TXN-004: 7-day rolling split-invoicing aggregate
     """
     results = []
-    threshold_str = format_currency(threshold_limit)
     
     date_col = col_map.get("date", "date") if col_map else "date"
     amt_col = col_map.get("amount", "amount") if col_map else "amount"
@@ -44,22 +43,18 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
                 "rule_name": "Missing Sign-off Approval",
                 "severity": "HIGH",
                 "amount": amt,
-                "threshold": threshold_limit,
-                "formatted_threshold": threshold_str,
                 "description": f"Transaction of {format_currency(amt)} lacks documented authorizing approval sign-off.",
                 "remediation": "Obtain signed physical or digital approval voucher before clearance."
             })
 
-        # TXN-002: Exact round-number disbursement >= threshold
-        if amt >= threshold_limit and amt % 1000 == 0:
+        # TXN-002: Exact round-number disbursement
+        if amt > 0 and amt % 1000 == 0:
             flags.append({
                 "rule_code": "TXN-002",
                 "rule_name": "Exact Round-Number Disbursement",
                 "severity": "HIGH",
                 "amount": amt,
-                "threshold": threshold_limit,
-                "formatted_threshold": threshold_str,
-                "description": f"Exact round figure disbursement of {format_currency(amt)} exceeds the {threshold_str} audit threshold.",
+                "description": f"Exact round figure disbursement of {format_currency(amt)} detected.",
                 "remediation": "Obtain itemized vendor invoice; inspect line-item cost breakdown."
             })
 
@@ -72,15 +67,13 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
                 (df_clean[date_col] <= row_date)
             ]
             rolling_sum = vendor_txns[amt_col].sum()
-            if len(vendor_txns) > 1 and rolling_sum > threshold_limit:
+            if len(vendor_txns) > 1:
                 flags.append({
                     "rule_code": "TXN-004",
                     "rule_name": "7-Day Split Invoicing Breach",
                     "severity": "HIGH",
                     "amount": rolling_sum,
-                    "threshold": threshold_limit,
-                    "formatted_threshold": threshold_str,
-                    "description": f"Multiple disbursements to '{vendor}' within 7 days aggregate to {format_currency(rolling_sum)}, exceeding the {threshold_str} limit.",
+                    "description": f"Multiple disbursements to '{vendor}' within 7 days aggregate to {format_currency(rolling_sum)}.",
                     "remediation": "Merge purchase orders & audit against master service agreement limits."
                 })
 
