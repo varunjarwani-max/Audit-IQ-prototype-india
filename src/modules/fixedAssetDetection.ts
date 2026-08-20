@@ -44,7 +44,17 @@ export function runFixedAssetDetection(
     return isNaN(d.getTime()) ? null : d;
   };
 
-  const REFERENCE_TODAY = new Date('2024-10-25T00:00:00Z');
+  // Dynamic reference benchmark date: max of all observed purchase dates or current date
+  let maxObservedTime = 0;
+  records.forEach(r => {
+    const d = parseDate(getVal(r, 'purchase_date'));
+    if (d && d.getTime() > maxObservedTime) maxObservedTime = d.getTime();
+  });
+
+  const REFERENCE_TODAY = maxObservedTime > 0 
+    ? new Date(Math.max(maxObservedTime, Date.now())) 
+    : new Date();
+
 
   const flaggedRecords: FlaggedRecord[] = [];
   let criticalCount = 0;

@@ -44,8 +44,21 @@ export function runAgingDetection(
     return isNaN(d.getTime()) ? null : d;
   };
 
-  // Fixed benchmark date for repeatable testing: 2024-10-25
-  const REFERENCE_TODAY = new Date('2024-10-25T00:00:00Z');
+  // Dynamic reference benchmark date: max of all observed dates in workpaper or current date
+  let maxObservedTime = 0;
+  records.forEach(r => {
+    const d1 = parseDate(getVal(r, 'due_date'));
+    const d2 = parseDate(getVal(r, 'invoice_date'));
+    const d3 = parseDate(getVal(r, 'payment_date'));
+    if (d1 && d1.getTime() > maxObservedTime) maxObservedTime = d1.getTime();
+    if (d2 && d2.getTime() > maxObservedTime) maxObservedTime = d2.getTime();
+    if (d3 && d3.getTime() > maxObservedTime) maxObservedTime = d3.getTime();
+  });
+
+  const REFERENCE_TODAY = maxObservedTime > 0 
+    ? new Date(Math.max(maxObservedTime, Date.now())) 
+    : new Date();
+
 
   // Group by customer/vendor to detect chronic delinquency
   const partyHistory: Record<string, { totalInvoices: number; overdueCount: number; totalOverdueSum: number }> = {};

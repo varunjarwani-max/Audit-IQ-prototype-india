@@ -1,89 +1,103 @@
 """
 rules_engine.py
-Vectorized Pandas Anomaly Detection Engines for AuditIQ.
-Operates on batches and returns itemized findings per row with rule codes, severity, and remediation guidance.
+High-Performance Vectorized Anomaly Detection Engines for AuditIQ.
+Optimized for zero-latency execution on 10,000+ row files using boolean vector masks and itertuples.
+Includes parameterized and dynamic reference dates for aging and fixed asset schedules.
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Union
 
 
-def audit_transactions(df: pd.DataFrame, col_map: Dict[str, str], threshold_limit: float = 50000.0) -> List[Dict[str, Any]]:
+def audit_transactions(
+    df: pd.DataFrame, 
+    col_map: Dict[str, str], 
+    threshold_limit: float = 50000.0
+) -> List[Dict[str, Any]]:
     """
-    Vectorized Transaction Audit Rules:
+    High-Performance Vectorized Transaction Audit Rules:
     1. TXN-001: Missing Approval Sign-off
     2. TXN-002: Exact Round-Number Amount over Threshold (₹50,000+)
     3. TXN-003: Near-Threshold Structuring Zone (₹45,000 - ₹49,999.99)
     4. TXN-004: Multi-Payment Vendor Structuring (7-day window)
     """
     findings = []
-    if df.empty:
+    if df is None or df.empty:
         return findings
 
     working_df = df.copy().reset_index(drop=True)
+    n_rows = len(working_df)
     
-    # Extract mapped columns or fallback to best guess
     col_amount = col_map.get("amount", "amount")
     col_approved = col_map.get("approved_by", "approved_by")
     col_vendor = col_map.get("vendor", "vendor")
     col_date = col_map.get("date", "date")
 
-    # Safe conversion
-    working_df["_amt"] = pd.to_numeric(working_df.get(col_amount, 0), errors="coerce").fillna(0)
-    working_df["_date"] = pd.to_datetime(working_df.get(col_date, ""), errors="coerce")
-    working_df["_vendor"] = working_df.get(col_vendor, "").astype(str).fillna("").str.strip()
-    working_df["_approver"] = working_df.get(col_approved, "").astype(str).fillna("").str.strip()
+    # Fast Vectorized Pre-processing
+    amt_series = pd.to_numeric(working_df.get(col_amount, 0), errors="coerce").fillna(0)
+    date_series = pd.to_datetime(working_df.get(col_date, ""), errors="coerce")
+    vendor_series = working_df.get(col_vendor, "").astype(str).fillna("").str.strip()
+    approver_series = working_df.get(col_approved, "").astype(str).fillna("").str.strip()
 
+    working_df["_amt"] = amt_series
+    working_df["_date"] = date_series
+    working_df["_vendor"] = vendor_series
+    working_df["_approver"] = approver_series
+
+    # Vectorized Rule Masks
     # Rule 1: Missing Approvals
     missing_approval_mask = (
-        working_df["_approver"].isna() | 
-        (working_df["_approver"] == "") | 
-        working_df["_approver"].str.lower().isin(["none", "null", "nan", "unassigned", "-"])
-    )
+        approver_series.isna() | 
+        (approver_series == "") | 
+        approver_series.str.lower().isin(["none", "null", "nan", "unassigned", "-", "n/a", "undefined"])
+    ).to_numpy()
 
     # Rule 2: Round Numbers over threshold (₹50,000+)
+    amt_arr = amt_series.to_numpy()
     round_number_mask = (
-        (working_df["_amt"] >= threshold_limit) & 
-        ((working_df["_amt"] % 1000 == 0) | (working_df["_amt"] % 5000 == 0))
+        (amt_arr >= threshold_limit) & 
+        ((amt_arr % 1000 == 0) | (amt_arr % 5000 == 0))
     )
 
-    # Rule 3: Near-Threshold Structuring (₹45,000 - ₹49,999.99)
+    # Rule 3: Near-Threshold Structuring (90% to < 100% of threshold)
     structuring_mask = (
-        (working_df["_amt"] >= (threshold_limit * 0.90)) & 
-        (working_df["_amt"] < threshold_limit)
+        (amt_arr >= (threshold_limit * 0.90)) & 
+        (amt_arr < threshold_limit)
     )
 
     # Rule 4: Multi-Payment Vendor Structuring within 7-Day Window
     structuring_7d_indices = set()
-    for vendor_name, group in working_df.groupby("_vendor"):
-        if vendor_name and len(group) > 1:
-            valid_dates = group.dropna(subset=["_date"]).sort_values("_date")
-            if len(valid_dates) > 1:
-                dates = valid_dates["_date"].values
-                amounts = valid_dates["_amt"].values
-                idxs = valid_dates.index.values
-                
-                for i in range(len(dates)):
-                    window_idxs = [idxs[i]]
-                    window_amt = amounts[i]
-                    for j in range(i + 1, len(dates)):
-                        diff_days = (dates[j] - dates[i]) / np.timedelta64(1, 'D')
-                        if diff_days <= 7:
-                            window_idxs.append(idxs[j])
-                            window_amt += amounts[j]
-                    if len(window_idxs) > 1 and window_amt >= threshold_limit:
-                        structuring_7d_indices.update(window_idxs)
+    valid_dates_mask = date_series.notna().to_numpy()
+    if valid_dates_mask.any():
+        for vendor_name, group in working_df.groupby("_vendor"):
+            if vendor_name and len(group) > 1:
+                valid_group = group.dropna(subset=["_date"]).sort_values("_date")
+                if len(valid_group) > 1:
+                    dates = valid_group["_date"].values
+                    amounts = valid_group["_amt"].values
+                    idxs = valid_group.index.values
+                    
+                    for i in range(len(dates)):
+                        window_idxs = [idxs[i]]
+                        window_amt = amounts[i]
+                        for j in range(i + 1, len(dates)):
+                            diff_days = (dates[j] - dates[i]) / np.timedelta64(1, 'D')
+                            if diff_days <= 7:
+                                window_idxs.append(idxs[j])
+                                window_amt += amounts[j]
+                        if len(window_idxs) > 1 and window_amt >= threshold_limit:
+                            structuring_7d_indices.update(window_idxs)
 
-    # Compile itemized findings per row
-    for idx, row in working_df.iterrows():
+    # Fast Row Compilation using pre-computed arrays & itertuples
+    for idx, row in enumerate(working_df.itertuples(index=False)):
         row_flags = []
-        amt_val = row["_amt"]
-        approver_val = row["_approver"]
-        vendor_val = row["_vendor"]
+        amt_val = float(amt_arr[idx])
+        approver_val = str(approver_series.iloc[idx])
+        vendor_val = str(vendor_series.iloc[idx])
 
-        if missing_approval_mask.iloc[idx]:
+        if missing_approval_mask[idx]:
             row_flags.append({
                 "rule_code": "TXN-001",
                 "rule_name": "Missing Approval Sign-off",
@@ -94,7 +108,7 @@ def audit_transactions(df: pd.DataFrame, col_map: Dict[str, str], threshold_limi
                 "remediation": "Request physical or digital approval voucher before disbursement clearance."
             })
 
-        if round_number_mask.iloc[idx]:
+        if round_number_mask[idx]:
             row_flags.append({
                 "rule_code": "TXN-002",
                 "rule_name": "Exact Round-Number Disbursement",
@@ -105,7 +119,7 @@ def audit_transactions(df: pd.DataFrame, col_map: Dict[str, str], threshold_limi
                 "remediation": "Obtain itemized vendor invoice and inspect line-item cost components."
             })
 
-        if structuring_mask.iloc[idx]:
+        if structuring_mask[idx]:
             row_flags.append({
                 "rule_code": "TXN-003",
                 "rule_name": "Near-Threshold Structuring Evasion",
@@ -138,15 +152,23 @@ def audit_transactions(df: pd.DataFrame, col_map: Dict[str, str], threshold_limi
     return findings
 
 
-def audit_aging(df: pd.DataFrame, col_map: Dict[str, str], severe_overdue_days: int = 90) -> List[Dict[str, Any]]:
+def audit_aging(
+    df: pd.DataFrame, 
+    col_map: Dict[str, str], 
+    severe_overdue_days: int = 90,
+    as_of_date: Optional[Union[datetime, str]] = None
+) -> List[Dict[str, Any]]:
     """
     Vectorized AR/AP Aging Audit Rules:
     1. AGE-001: Severe Overdue Exposure (> 90 Days Past Maturity)
     2. AGE-002: Inverted Settlement Chronology (Payment Date < Invoice Date)
     3. AGE-003: Chronic Counterparty Delinquency
+
+    Parameters:
+    - as_of_date: Reference audit benchmark date. If None, dynamically resolves to max date in data or datetime.now().
     """
     findings = []
-    if df.empty:
+    if df is None or df.empty:
         return findings
 
     working_df = df.copy().reset_index(drop=True)
@@ -157,57 +179,79 @@ def audit_aging(df: pd.DataFrame, col_map: Dict[str, str], severe_overdue_days: 
     col_party = col_map.get("customer_vendor", "customer_vendor")
     col_status = col_map.get("invoice_status", "invoice_status")
 
-    working_df["_inv_date"] = pd.to_datetime(working_df.get(col_inv_date, ""), errors="coerce")
-    working_df["_due_date"] = pd.to_datetime(working_df.get(col_due_date, ""), errors="coerce")
-    working_df["_pay_date"] = pd.to_datetime(working_df.get(col_pay_date, ""), errors="coerce")
-    working_df["_amt"] = pd.to_numeric(working_df.get(col_amt, 0), errors="coerce").fillna(0)
-    working_df["_party"] = working_df.get(col_party, "").astype(str).fillna("").str.strip()
-    working_df["_status"] = working_df.get(col_status, "").astype(str).fillna("").str.upper()
+    inv_date_series = pd.to_datetime(working_df.get(col_inv_date, ""), errors="coerce")
+    due_date_series = pd.to_datetime(working_df.get(col_due_date, ""), errors="coerce")
+    pay_date_series = pd.to_datetime(working_df.get(col_pay_date, ""), errors="coerce")
+    amt_series = pd.to_numeric(working_df.get(col_amt, 0), errors="coerce").fillna(0)
+    party_series = working_df.get(col_party, "").astype(str).fillna("").str.strip()
+    status_series = working_df.get(col_status, "").astype(str).fillna("").str.upper()
 
-    now = datetime(2024, 2, 28)  # Reference benchmark date
+    working_df["_inv_date"] = inv_date_series
+    working_df["_due_date"] = due_date_series
+    working_df["_pay_date"] = pay_date_series
+    working_df["_amt"] = amt_series
+    working_df["_party"] = party_series
+    working_df["_status"] = status_series
+
+    # Dynamic Benchmark Date Resolution
+    if as_of_date is not None:
+        ref_date = pd.to_datetime(as_of_date)
+    else:
+        # Resolve to the maximum observed date in the workpaper or current date
+        all_valid_dates = pd.concat([inv_date_series.dropna(), due_date_series.dropna(), pay_date_series.dropna()])
+        if not all_valid_dates.empty:
+            ref_date = max(all_valid_dates.max(), pd.to_datetime(datetime.now()))
+        else:
+            ref_date = pd.to_datetime(datetime.now())
+
+    # Overdue Days calculation (safe from negative overflow)
+    days_past_due = (ref_date - due_date_series).dt.days.fillna(0)
+    days_past_due = np.maximum(0, days_past_due)
 
     # Overdue Mask
+    unpaid_mask = pay_date_series.isna() | (pay_date_series == "")
     overdue_mask = (
-        (working_df["_due_date"].notna()) & 
-        (working_df["_pay_date"].isna() | (working_df["_pay_date"] == "")) &
-        ((now - working_df["_due_date"]).dt.days > severe_overdue_days) |
-        (working_df["_status"].str.contains("OVERDUE|DELINQUENT"))
-    )
+        (due_date_series.notna() & unpaid_mask & (days_past_due > severe_overdue_days)) |
+        (status_series.str.contains("OVERDUE|DELINQUENT", regex=True))
+    ).to_numpy()
 
     # Inverted Timeline Mask
     inverted_mask = (
-        working_df["_inv_date"].notna() & 
-        working_df["_pay_date"].notna() & 
-        (working_df["_pay_date"] < working_df["_inv_date"])
-    )
+        inv_date_series.notna() & 
+        pay_date_series.notna() & 
+        (pay_date_series < inv_date_series)
+    ).to_numpy()
 
     # Chronic Delinquency
     party_overdue_counts = working_df[overdue_mask]["_party"].value_counts().to_dict()
 
-    for idx, row in working_df.iterrows():
+    for idx, row in enumerate(working_df.itertuples(index=False)):
         row_flags = []
-        amt_val = row["_amt"]
-        party_val = row["_party"]
+        amt_val = float(amt_series.iloc[idx])
+        party_val = str(party_series.iloc[idx])
+        due_d = due_date_series.iloc[idx]
+        inv_d = inv_date_series.iloc[idx]
+        pay_d = pay_date_series.iloc[idx]
 
-        if overdue_mask.iloc[idx]:
-            days_past = (now - row["_due_date"]).days if pd.notna(row["_due_date"]) else 120
+        if overdue_mask[idx]:
+            dp = int(days_past_due.iloc[idx])
             row_flags.append({
                 "rule_code": "AGE-001",
                 "rule_name": f"Severe Overdue Aging (> {severe_overdue_days} Days)",
                 "severity": "CRITICAL" if amt_val >= 100000 else "HIGH",
-                "description": f"Invoice of ₹{amt_val:,.2f} is {max(days_past, 95)} days past due date.",
-                "detected_value": f"Due: {str(row['_due_date'])[:10]} | Open Balance: ₹{amt_val:,.2f}",
+                "description": f"Invoice of ₹{amt_val:,.2f} is {max(dp, severe_overdue_days + 1)} days past due date.",
+                "detected_value": f"Due: {str(due_d)[:10]} | Open Balance: ₹{amt_val:,.2f}",
                 "expected": f"Settlement within contractual credit terms (< {severe_overdue_days} days).",
                 "remediation": "Initiate legal notice and provision allowance for doubtful accounts (ECL model)."
             })
 
-        if inverted_mask.iloc[idx]:
+        if inverted_mask[idx]:
             row_flags.append({
                 "rule_code": "AGE-002",
                 "rule_name": "Inverted Chronology (Payment Before Invoice)",
                 "severity": "CRITICAL",
-                "description": f"Remittance date ({str(row['_pay_date'])[:10]}) predates invoice origination ({str(row['_inv_date'])[:10]}).",
-                "detected_value": f"Paid: {str(row['_pay_date'])[:10]} < Invoiced: {str(row['_inv_date'])[:10]}",
+                "description": f"Remittance date ({str(pay_d)[:10]}) predates invoice origination ({str(inv_d)[:10]}).",
+                "detected_value": f"Paid: {str(pay_d)[:10]} < Invoiced: {str(inv_d)[:10]}",
                 "expected": "Invoice date <= Payment date chronologically.",
                 "remediation": "Audit ERP billing ledger timestamps to correct backdated record entry."
             })
@@ -234,7 +278,11 @@ def audit_aging(df: pd.DataFrame, col_map: Dict[str, str], severe_overdue_days: 
     return findings
 
 
-def audit_general_ledger(df: pd.DataFrame, col_map: Dict[str, str], period_end_days: int = 4) -> List[Dict[str, Any]]:
+def audit_general_ledger(
+    df: pd.DataFrame, 
+    col_map: Dict[str, str], 
+    period_end_days: int = 4
+) -> List[Dict[str, Any]]:
     """
     Vectorized General Ledger Audit Rules:
     1. GL-001: Double-Entry Voucher Imbalance (Debits != Credits)
@@ -243,7 +291,7 @@ def audit_general_ledger(df: pd.DataFrame, col_map: Dict[str, str], period_end_d
     4. GL-004: Suspense / Unallocated Clearing Account Usage
     """
     findings = []
-    if df.empty:
+    if df is None or df.empty:
         return findings
 
     working_df = df.copy().reset_index(drop=True)
@@ -253,34 +301,41 @@ def audit_general_ledger(df: pd.DataFrame, col_map: Dict[str, str], period_end_d
     col_cr = col_map.get("credit", "credit")
     col_ref = col_map.get("journal_reference", "journal_reference")
 
-    working_df["_date"] = pd.to_datetime(working_df.get(col_date, ""), errors="coerce")
-    working_df["_acc"] = working_df.get(col_acc, "").astype(str).fillna("").str.strip()
-    working_df["_dr"] = pd.to_numeric(working_df.get(col_dr, 0), errors="coerce").fillna(0)
-    working_df["_cr"] = pd.to_numeric(working_df.get(col_cr, 0), errors="coerce").fillna(0)
-    working_df["_ref"] = working_df.get(col_ref, "").astype(str).fillna("").str.strip()
+    date_series = pd.to_datetime(working_df.get(col_date, ""), errors="coerce")
+    acc_series = working_df.get(col_acc, "").astype(str).fillna("").str.strip()
+    dr_series = pd.to_numeric(working_df.get(col_dr, 0), errors="coerce").fillna(0)
+    cr_series = pd.to_numeric(working_df.get(col_cr, 0), errors="coerce").fillna(0)
+    ref_series = working_df.get(col_ref, "").astype(str).fillna("").str.strip()
+
+    working_df["_date"] = date_series
+    working_df["_acc"] = acc_series
+    working_df["_dr"] = dr_series
+    working_df["_cr"] = cr_series
+    working_df["_ref"] = ref_series
 
     # Rule 1: Double-entry imbalance by journal reference
     ref_totals = working_df.groupby("_ref").agg({"_dr": "sum", "_cr": "sum"})
     unbalanced_refs = set(ref_totals[abs(ref_totals["_dr"] - ref_totals["_cr"]) > 0.01].index)
 
     # Rule 2: Weekend Postings (Saturday = 5, Sunday = 6)
-    weekend_mask = working_df["_date"].dt.dayofweek.isin([5, 6])
+    weekend_mask = date_series.dt.dayofweek.isin([5, 6]).to_numpy()
 
     # Rule 3: Month-end Close Entries (last N days of month)
     is_period_end_mask = (
-        working_df["_date"].notna() & 
-        (working_df["_date"].dt.day >= (working_df["_date"].dt.days_in_month - period_end_days))
-    )
+        date_series.notna() & 
+        (date_series.dt.day >= (date_series.dt.days_in_month - period_end_days))
+    ).to_numpy()
 
     # Rule 4: Suspense / Clearing Account Usage
-    suspense_mask = working_df["_acc"].str.contains(r"suspense|clearing|unallocated|wash|temp|dummy", case=False, regex=True)
+    suspense_mask = acc_series.str.contains(r"suspense|clearing|unallocated|wash|temp|dummy", case=False, regex=True).to_numpy()
 
-    for idx, row in working_df.iterrows():
+    for idx, row in enumerate(working_df.itertuples(index=False)):
         row_flags = []
-        ref_val = row["_ref"]
-        acc_val = row["_acc"]
-        dr_val = row["_dr"]
-        cr_val = row["_cr"]
+        ref_val = str(ref_series.iloc[idx])
+        acc_val = str(acc_series.iloc[idx])
+        dr_val = float(dr_series.iloc[idx])
+        cr_val = float(cr_series.iloc[idx])
+        date_val = date_series.iloc[idx]
 
         if ref_val in unbalanced_refs:
             tot_dr = ref_totals.loc[ref_val, "_dr"]
@@ -295,29 +350,30 @@ def audit_general_ledger(df: pd.DataFrame, col_map: Dict[str, str], period_end_d
                 "remediation": "Reconcile offsetting credit/debit leg before posting to master ledger."
             })
 
-        if weekend_mask.iloc[idx]:
-            day_name = row["_date"].strftime("%A") if pd.notna(row["_date"]) else "Weekend"
+        if weekend_mask[idx]:
+            day_name = date_val.strftime("%A") if pd.notna(date_val) else "Weekend"
             row_flags.append({
                 "rule_code": "GL-002",
                 "rule_name": "Weekend / Off-Hours Journal Entry",
                 "severity": "HIGH",
                 "description": f"Manual journal adjustment posted on {day_name} outside business authorization hours.",
-                "detected_value": f"Posting Date: {str(row['_date'])[:10]} ({day_name})",
+                "detected_value": f"Posting Date: {str(date_val)[:10]} ({day_name})",
                 "expected": "Standard business weekday postings under active supervisory oversight.",
                 "remediation": "Verify management sign-off and server authentication logs for emergency weekend entry."
             })
 
-        if is_period_end_mask.iloc[idx] and suspense_mask.iloc[idx]:
+        if is_period_end_mask[idx] and suspense_mask[idx]:
+            day_num = date_val.day if pd.notna(date_val) else "Month-End"
             row_flags.append({
                 "rule_code": "GL-003",
                 "rule_name": "High-Risk Period-End Suspense Adjustment",
                 "severity": "CRITICAL",
-                "description": f"Month-end adjustment booked directly to clearing account '{acc_val}' on day {row['_date'].day}.",
+                "description": f"Month-end adjustment booked directly to clearing account '{acc_val}' on day {day_num}.",
                 "detected_value": f"Account: {acc_val} | Amount: ₹{max(dr_val, cr_val):,.2f}",
                 "expected": "Full clear-down of temporary accounts prior to month-end close.",
                 "remediation": "Require substantiating supporting schedules for temporary clearing accounts."
             })
-        elif suspense_mask.iloc[idx]:
+        elif suspense_mask[idx]:
             row_flags.append({
                 "rule_code": "GL-004",
                 "rule_name": "Suspense / Clearing Account Parking",
@@ -339,15 +395,22 @@ def audit_general_ledger(df: pd.DataFrame, col_map: Dict[str, str], period_end_d
     return findings
 
 
-def audit_fixed_assets(df: pd.DataFrame, col_map: Dict[str, str]) -> List[Dict[str, Any]]:
+def audit_fixed_assets(
+    df: pd.DataFrame, 
+    col_map: Dict[str, str],
+    as_of_date: Optional[Union[datetime, str]] = None
+) -> List[Dict[str, Any]]:
     """
     Vectorized Fixed Asset Audit Rules:
     1. AST-001: Missing / Undefined Depreciation Schedule
     2. AST-002: Valuation Discrepancy (Carrying Value > Purchase Cost)
     3. AST-003: Straight-Line Mathematical Curve Discrepancy
+
+    Parameters:
+    - as_of_date: Reference audit benchmark date. If None, dynamically resolves to max date in data or datetime.now().
     """
     findings = []
-    if df.empty:
+    if df is None or df.empty:
         return findings
 
     working_df = df.copy().reset_index(drop=True)
@@ -358,23 +421,38 @@ def audit_fixed_assets(df: pd.DataFrame, col_map: Dict[str, str]) -> List[Dict[s
     col_life = col_map.get("useful_life", "useful_life")
     col_val = col_map.get("current_value", "current_value")
 
-    working_df["_name"] = working_df.get(col_name, "").astype(str).fillna("")
-    working_df["_date"] = pd.to_datetime(working_df.get(col_date, ""), errors="coerce")
-    working_df["_cost"] = pd.to_numeric(working_df.get(col_cost, 0), errors="coerce").fillna(0)
-    working_df["_method"] = working_df.get(col_method, "").astype(str).fillna("").str.strip()
-    working_df["_life"] = pd.to_numeric(working_df.get(col_life, 0), errors="coerce").fillna(0)
-    working_df["_curr_val"] = pd.to_numeric(working_df.get(col_val, 0), errors="coerce").fillna(0)
+    name_series = working_df.get(col_name, "").astype(str).fillna("")
+    date_series = pd.to_datetime(working_df.get(col_date, ""), errors="coerce")
+    cost_series = pd.to_numeric(working_df.get(col_cost, 0), errors="coerce").fillna(0)
+    method_series = working_df.get(col_method, "").astype(str).fillna("").str.strip()
+    life_series = pd.to_numeric(working_df.get(col_life, 0), errors="coerce").fillna(0)
+    curr_val_series = pd.to_numeric(working_df.get(col_val, 0), errors="coerce").fillna(0)
 
-    now = datetime(2024, 2, 28)
+    working_df["_name"] = name_series
+    working_df["_date"] = date_series
+    working_df["_cost"] = cost_series
+    working_df["_method"] = method_series
+    working_df["_life"] = life_series
+    working_df["_curr_val"] = curr_val_series
 
-    for idx, row in working_df.iterrows():
+    # Dynamic Benchmark Date Resolution
+    if as_of_date is not None:
+        ref_date = pd.to_datetime(as_of_date)
+    else:
+        valid_dates = date_series.dropna()
+        if not valid_dates.empty:
+            ref_date = max(valid_dates.max(), pd.to_datetime(datetime.now()))
+        else:
+            ref_date = pd.to_datetime(datetime.now())
+
+    for idx, row in enumerate(working_df.itertuples(index=False)):
         row_flags = []
-        name_val = row["_name"]
-        cost_val = row["_cost"]
-        curr_val = row["_curr_val"]
-        method_val = row["_method"]
-        life_val = row["_life"]
-        purch_date = row["_date"]
+        name_val = str(name_series.iloc[idx])
+        cost_val = float(cost_series.iloc[idx])
+        curr_val = float(curr_val_series.iloc[idx])
+        method_val = str(method_series.iloc[idx])
+        life_val = float(life_series.iloc[idx])
+        purch_date = date_series.iloc[idx]
 
         # Rule 1: Missing method
         if not method_val or method_val.lower() in ["none", "null", "nan", "-", "undefined"]:
@@ -400,12 +478,13 @@ def audit_fixed_assets(df: pd.DataFrame, col_map: Dict[str, str]) -> List[Dict[s
                 "remediation": "Inspect asset ledger for unauthorized write-ups or misallocated additions."
             })
 
-        # Rule 3: Straight line math discrepancy check
-        if method_val.lower() == "straight line" and life_val > 0 and pd.notna(purch_date) and cost_val > 0:
-            elapsed_years = (now - purch_date).days / 365.25
+        # Rule 3: Straight line math discrepancy check (handles future/current dates cleanly without negative elapsed years)
+        if method_val.lower() in ["straight line", "slm", "straight-line"] and life_val > 0 and pd.notna(purch_date) and cost_val > 0:
+            diff_days = (ref_date - purch_date).days
+            elapsed_years = max(0.0, diff_days / 365.25)
             if elapsed_years > 0.5:
                 expected_annual_dep = cost_val / life_val
-                expected_curr_val = max(0.0, cost_val - (expected_annual_dep * elapsed_years))
+                expected_curr_val = max(0.0, cost_val - (expected_annual_dep * min(elapsed_years, life_val)))
                 variance = abs(curr_val - expected_curr_val)
                 if variance > (cost_val * 0.20) and curr_val > expected_curr_val:
                     row_flags.append({

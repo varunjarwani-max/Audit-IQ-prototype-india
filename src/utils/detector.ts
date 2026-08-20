@@ -10,7 +10,7 @@ export const SIGNATURES: ColumnSignature[] = [
     secondaryHeaders: ['transaction_id', 'description', 'payment_method', 'currency', 'receipt_attached'],
     aliasMap: {
       date: ['date', 'txn_date', 'transaction_date', 'trans_date', 'spend_date', 'posting_date', 'timestamp'],
-      amount: ['amount', 'txn_amount', 'total_amount', 'cost', 'spend', 'amount_usd', 'subtotal', 'charge'],
+      amount: ['amount', 'txn_amount', 'total_amount', 'cost', 'spend', 'amount_inr', 'amount_usd', 'subtotal', 'charge'],
       vendor: ['vendor', 'supplier', 'payee', 'merchant', 'vendor_name', 'counterparty', 'contractor', 'seller'],
       account_code: ['account_code', 'account_no', 'gl_code', 'expense_code', 'cost_code', 'chart_of_accounts'],
       approved_by: ['approved_by', 'approver', 'authorized_by', 'signer', 'approved', 'approval_user', 'manager'],
@@ -62,7 +62,7 @@ export const SIGNATURES: ColumnSignature[] = [
       purchase_cost: ['purchase_cost', 'original_cost', 'acquisition_cost', 'initial_cost', 'historical_cost', 'gross_book_value', 'cost'],
       depreciation_method: ['depreciation_method', 'depr_method', 'method', 'depreciation_type', 'depr_type'],
       useful_life: ['useful_life', 'useful_life_years', 'asset_life', 'lifespan_years', 'life_years', 'life'],
-      current_value: ['current_value', 'book_value', 'net_book_value', 'carrying_value', 'residual_value', 'current_book_value']
+      current_value: ['current_value', 'book_value', 'net_book_value', 'carrying_value', 'residual_value', 'current_book_value', 'nbv']
     }
   }
 ];
@@ -74,6 +74,26 @@ export function normalizeHeader(header: string): string {
     .replace(/[^a-z0-9]/g, '_')
     .replace(/_+/g, '_')
     .replace(/^_|_$/g, '');
+}
+
+/**
+ * Token-boundary alias matcher preventing false positives like 'dr' in 'address'
+ */
+export function aliasMatchesHeader(alias: string, normHeader: string): boolean {
+  if (!alias || !normHeader) return false;
+  const normAlias = normalizeHeader(alias);
+  if (normAlias === normHeader) return true;
+
+  const tokens = normHeader.split('_');
+  if (normAlias.length <= 3) {
+    return tokens.includes(normAlias);
+  }
+
+  if (tokens.includes(normAlias)) return true;
+
+  // Boundary regex: must be bounded by start/end of string or underscores
+  const regex = new RegExp(`(^|_)${normAlias}(_|$)`);
+  return regex.test(normHeader);
 }
 
 /**
@@ -104,19 +124,12 @@ export function classifyFinancialData(headers: string[]): DetectionClassificatio
     const missingCritical: string[] = [];
     const matchedHeaderMap: Record<string, string> = {};
 
-    // Check primary headers
+    // Check primary headers using token-boundary match
     for (const primaryKey of signature.primaryHeaders) {
       const aliases = signature.aliasMap[primaryKey] || [primaryKey];
       
       const foundMatch = normalizedHeaders.find(nh => {
-        return aliases.some(alias => {
-          const normAlias = normalizeHeader(alias);
-          return (
-            nh.norm === normAlias ||
-            nh.norm.includes(normAlias) ||
-            normAlias.includes(nh.norm)
-          );
-        });
+        return aliases.some(alias => aliasMatchesHeader(alias, nh.norm));
       });
 
       if (foundMatch) {
@@ -129,14 +142,13 @@ export function classifyFinancialData(headers: string[]): DetectionClassificatio
 
     // Check secondary headers
     for (const secKey of signature.secondaryHeaders) {
-      const normSec = normalizeHeader(secKey);
-      const foundMatch = normalizedHeaders.find(nh => nh.norm.includes(normSec) || normSec.includes(nh.norm));
+      const foundMatch = normalizedHeaders.find(nh => aliasMatchesHeader(secKey, nh.norm));
       if (foundMatch && !matchedHeaderMap[foundMatch.raw]) {
         matchedSecondary.push(secKey);
       }
     }
 
-    // Primary matches are weighted 80%, secondary 20%
+    // Primary matches are weighted 85%, secondary 15%
     const primaryRatio = matchedPrimary.length / signature.primaryHeaders.length;
     const secondaryRatio = signature.secondaryHeaders.length > 0
       ? Math.min(1, matchedSecondary.length / 2)
@@ -178,24 +190,14 @@ export function classifyFinancialData(headers: string[]): DetectionClassificatio
   scores.sort((a, b) => b.score - a.score);
 
   const topMatch = scores[0];
-  const secondMatch = scores[1];
+  const detectedType: FinancialDataType = topMatch && topMatch.score >= 50
+    ? topMatch.category
+    : 'ambiguous';
 
-  // Ambiguity rules:
-  // 1. Top score is below 45%
-  // 2. Or top score is relatively low (<65%) and within 10 points of the second score
-  // 3. Or fewer than 3 primary columns matched
-  const scoreGap = topMatch ? topMatch.score - (secondMatch ? secondMatch.score : 0) : 0;
-  const isAmbiguous = 
-    !topMatch || 
-    topMatch.score < 45 || 
-    (topMatch.score < 65 && scoreGap < 10) ||
-    topMatch.matchedPrimary.length < 2;
-
-  const detectedType: FinancialDataType = isAmbiguous ? 'ambiguous' : topMatch.category;
-  
-  const reasons: string[] = [];
+  const isAmbiguous = detectedType === 'ambiguous';
   const matchedColumns: Record<string, string> = {};
   const unmatchedHeaders: string[] = [];
+  const reasons: string[] = [];
 
   if (topMatch && !isAmbiguous) {
     const signature = SIGNATURES.find(s => s.category === topMatch.category)!;
@@ -210,10 +212,7 @@ export function classifyFinancialData(headers: string[]): DetectionClassificatio
       let mapped = false;
       for (const pKey of signature.primaryHeaders) {
         const aliases = signature.aliasMap[pKey] || [pKey];
-        if (aliases.some(a => {
-          const normA = normalizeHeader(a);
-          return nh.norm === normA || nh.norm.includes(normA) || normA.includes(nh.norm);
-        })) {
+        if (aliases.some(a => aliasMatchesHeader(a, nh.norm))) {
           matchedColumns[nh.raw] = pKey;
           mapped = true;
           break;
@@ -252,4 +251,3 @@ export function getCategoryFields(category: FinancialDataType): string[] {
   const sig = SIGNATURES.find(s => s.category === category);
   return sig ? sig.primaryHeaders : ['date', 'amount', 'vendor', 'account_code', 'approved_by', 'department'];
 }
-

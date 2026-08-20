@@ -1,10 +1,11 @@
 """
 detector.py
 Data Segregation & Column Alias Signature Classifier for AuditIQ.
+Enforces strict word-boundary token matching to prevent false positives (e.g. 'dr' in 'address').
 """
 
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 ALIAS_DEFINITIONS = {
     "transactions": {
@@ -13,9 +14,9 @@ ALIAS_DEFINITIONS = {
         "primary_fields": ["date", "amount", "vendor", "account_code", "approved_by", "department"],
         "aliases": {
             "date": ["date", "txn_date", "transaction_date", "trans_date", "spend_date", "posting_date", "timestamp"],
-            "amount": ["amount", "txn_amount", "total_amount", "cost", "spend", "amount_inr", "amount_usd", "subtotal", "val_num"],
-            "vendor": ["vendor", "supplier", "payee", "merchant", "vendor_name", "counterparty", "contractor", "col_beta"],
-            "account_code": ["account_code", "account_no", "gl_code", "expense_code", "cost_code", "code_ref"],
+            "amount": ["amount", "txn_amount", "total_amount", "cost", "spend", "amount_inr", "amount_usd", "subtotal", "val_num", "charge"],
+            "vendor": ["vendor", "supplier", "payee", "merchant", "vendor_name", "counterparty", "contractor", "seller"],
+            "account_code": ["account_code", "account_no", "gl_code", "expense_code", "cost_code", "code_ref", "chart_of_accounts"],
             "approved_by": ["approved_by", "approver", "authorized_by", "signer", "approved", "approval_user", "manager", "auth_user"],
             "department": ["department", "dept", "cost_center", "division", "business_unit", "team", "branch"]
         }
@@ -52,8 +53,8 @@ ALIAS_DEFINITIONS = {
         "primary_fields": ["asset_name", "purchase_date", "purchase_cost", "depreciation_method", "useful_life", "current_value"],
         "aliases": {
             "asset_name": ["asset_name", "asset_description", "equipment_name", "asset_title", "item_name", "asset"],
-            "purchase_date": ["purchase_date", "acquisition_date", "capitalization_date", "placed_in_service", "buy_date"],
-            "purchase_cost": ["purchase_cost", "original_cost", "historical_cost", "acquisition_cost", "asset_cost", "gross_book_value"],
+            "purchase_date": ["purchase_date", "acquisition_date", "capitalization_date", "placed_in_service", "buy_date", "in_service_date"],
+            "purchase_cost": ["purchase_cost", "original_cost", "historical_cost", "acquisition_cost", "asset_cost", "gross_book_value", "cost"],
             "depreciation_method": ["depreciation_method", "depr_method", "depr_type", "method", "depreciation_type"],
             "useful_life": ["useful_life", "lifespan", "useful_life_years", "life_years", "est_life", "asset_life"],
             "current_value": ["current_value", "book_value", "net_book_value", "nbv", "carrying_value", "present_value"]
@@ -70,9 +71,40 @@ def normalize_string(val: str) -> str:
     return re.sub(r'_+', '_', clean).strip('_')
 
 
+def alias_matches_column(alias: str, norm_col: str) -> bool:
+    """
+    Robust token-aware column matcher.
+    Prevents false positives where short aliases (e.g. 'dr' matching 'address' or 'cr' matching 'credit_card')
+    corrupt classification without exact token boundaries.
+    """
+    if not alias or not norm_col:
+        return False
+    
+    # Direct exact match
+    if alias == norm_col:
+        return True
+    
+    tokens = norm_col.split('_')
+    
+    # For short aliases (<= 3 characters, e.g. 'dr', 'cr', 'je', 'id', 'nbv', 'inv'), require exact token match
+    if len(alias) <= 3:
+        return alias in tokens
+
+    # For longer aliases, match whole token or anchored compound match
+    if alias in tokens:
+        return True
+    
+    # Word-boundary check: alias must appear surrounded by underscores or string boundaries
+    pattern = rf"(^|_){re.escape(alias)}(_|$)"
+    if re.search(pattern, norm_col):
+        return True
+    
+    return False
+
+
 def classify_columns(columns: List[str]) -> Dict[str, Any]:
     """
-    Analyzes list of columns against alias dictionaries.
+    Analyzes list of columns against alias dictionaries using token-boundary matching.
     Returns detected category, confidence percentage, matched field mappings, and routing metadata.
     """
     normalized_cols = {col: normalize_string(col) for col in columns}
@@ -88,9 +120,9 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
         for std_field in primary_fields:
             field_aliases = [normalize_string(a) for a in aliases.get(std_field, [std_field])]
             
-            # Find best match in uploaded columns
+            # Find best match in uploaded columns using token matching
             for orig_col, norm_col in normalized_cols.items():
-                if norm_col in field_aliases or any(alias in norm_col for alias in field_aliases):
+                if any(alias_matches_column(alias, norm_col) for alias in field_aliases):
                     matched_fields[std_field] = orig_col
                     matched_count += 1
                     break
