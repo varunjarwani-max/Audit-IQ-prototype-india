@@ -76,6 +76,7 @@ st.markdown("""
     }
     .badge-critical { background-color: #FEE2E2; color: #991B1B !important; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
     .badge-high { background-color: #FEF3C7; color: #92400E !important; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+    .sentry-alert { background-color: #FEF2F2; border-left: 4px solid #EF4444; padding: 12px; margin-bottom: 16px; border-radius: 4px; color: #991B1B !important; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -160,10 +161,16 @@ if st.session_state["multi_file_data"]:
     c3.metric("Total Flagged Anomalies", total_anomalies)
 
     if st.button("✨ Generate Unified Master Report", type="primary", use_container_width=True):
-        with st.spinner("Synthesizing multi-domain executive dossier..."):
-            master_memo = generate_consolidated_master_report(
+        with st.spinner("Calculating exact metrics and synthesizing dossier..."):
+            master_memo, sentry_warnings = generate_consolidated_master_report(
                 all_domain_data=st.session_state["multi_file_data"]
             )
+            
+            if sentry_warnings:
+                st.markdown("### ⚠️ Sentry Verification Alerts")
+                for warning in sentry_warnings:
+                    st.markdown(f"<div class='sentry-alert'><b>{warning}</b></div>", unsafe_allow_html=True)
+            
             st.markdown("#### 📑 Master Executive Dossier")
             st.markdown(master_memo)
             st.download_button("📥 Download Master Report", data=master_memo, file_name="AuditIQ_Master_Report.md", mime="text/markdown")
