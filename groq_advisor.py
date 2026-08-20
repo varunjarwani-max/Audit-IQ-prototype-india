@@ -3,8 +3,10 @@ groq_advisor.py - AI Report & Memo Synthesis for AuditIQ
 """
 
 import os
+import re
 import json
 from groq import Groq
+
 
 def get_groq_client():
     """Initializes and returns the Groq API client."""
@@ -17,6 +19,21 @@ def get_groq_client():
 def format_currency(val: float) -> str:
     """Guarantees strict two-decimal currency formatting required for Sentry verification."""
     return f"₹{float(val):,.2f}"
+
+
+def check_sentry_formatting(report_text: str) -> list:
+    """
+    Scans report text for monetary values and identifies formatting failures
+    without regex backtracking bugs or false-positive truncation matches.
+    """
+    pattern = r'₹\d{1,3}(?:,\d{3})*(\.\d+)?'
+    bad = []
+    for m in re.finditer(pattern, report_text):
+        decimal_part = m.group(1)
+        # must exist and be exactly ".XX" (dot + 2 digits)
+        if decimal_part is None or len(decimal_part) != 3:
+            bad.append(m.group(0))
+    return list(set(bad))
 
 
 def generate_consolidated_master_report(all_domain_data: dict):
@@ -94,13 +111,13 @@ Structure your output into 3 Sections:
 
     report_text = response.choices[0].message.content
 
-    # Post-generation Sentry verification check
+    # Post-generation Sentry verification check using the non-backtracking parser
+    unformatted_matches = check_sentry_formatting(report_text)
     sentry_warnings = []
-    import re
-    # Scan for currency values lacking decimal places (e.g., ₹60,000 without .00)
-    unformatted_matches = re.findall(r'₹\d{1,3}(?:,\d{3})*(?!\.\d{2})\b', report_text)
     if unformatted_matches:
-        sentry_warnings.append(f"Report contains unverified monetary figures lacking standard decimal precision: {list(set(unformatted_matches))}")
+        sentry_warnings.append(
+            f"Report contains unverified monetary figures lacking standard decimal precision: {unformatted_matches}"
+        )
 
     return report_text, sentry_warnings
 
@@ -108,7 +125,7 @@ Structure your output into 3 Sections:
 def generate_executive_memo(domain_name: str, findings: list):
     """Generates domain-level executive summary memo."""
     client = get_groq_client()
-    prompt = f"Provide a executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
+    prompt = f"Provide an executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
