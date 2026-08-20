@@ -63,7 +63,6 @@ def generate_consolidated_master_report(all_domain_data: dict):
             if item.get("status") == "FLAGGED":
                 for flag in item.get("flags", []):
                     amt = flag.get("amount", 0.0)
-                    threshold = flag.get("threshold")
                     
                     formatted_findings.append({
                         "domain": domain,
@@ -72,14 +71,13 @@ def generate_consolidated_master_report(all_domain_data: dict):
                         "severity": flag.get("severity"),
                         "description": flag.get("description"),
                         "formatted_amount": format_currency(amt) if amt > 0 else "N/A",
-                        "formatted_threshold": format_currency(threshold) if threshold else None,
                         "remediation": flag.get("remediation", "Review supporting documentation.")
                     })
 
     system_prompt = """You are an Executive Forensic Auditor generating an Audit Master Dossier.
 
 CRITICAL SENTRY VERIFICATION CONSTRAINTS:
-1. ALL currency figures AND rule thresholds MUST use explicit two-decimal formatting (e.g. write '₹50,000.00', NEVER write '₹50,000' or '₹50000').
+1. ALL currency figures MUST use explicit two-decimal formatting (e.g. write '₹60,000.00', NEVER write '₹60,000' or '₹60000').
 2. Every monetary figure in Section 1 (Executive Summary) MUST appear with identical decimal string formatting in Section 2 (Anomaly Register).
 3. Do NOT cut off or truncate Markdown tables. Render all table rows completely through completion.
 """
