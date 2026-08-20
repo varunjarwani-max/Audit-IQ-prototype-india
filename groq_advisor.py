@@ -1,12 +1,25 @@
 """
 Groq LLM Client & Ground-Truth Verified Workpaper Generator for AuditIQ.
-Architecture: 
+Architecture:
 - Arithmetic is strictly pre-calculated in Python (pandas).
-- LLM is constrained to narrate around injected ground-truth numbers.
-- Post-generation Sentry regex verifies the LLM did not hallucinate metrics.
+- Every rupee figure the LLM might need is replaced, BEFORE the prompt is
+  built, with an opaque ground-truth token (e.g. [[GT_7]]). The LLM is
+  instructed to place tokens verbatim and is never given the chance to
+  type a digit itself -- this is what actually prevents transcription
+  corruption (phantom offsets, dropped digits, etc.), because it removes
+  the failure mode at its source instead of trying to catch it afterward.
+- Post-generation: tokens are substituted back to their real values, and a
+  GENERIC sentry then scans the finished text for ANY rupee figure that
+  isn't traceable to a ground-truth value. Unlike a warn-only check, an
+  unverified figure here is a hard failure -- the corrupted report is never
+  returned to the user.
+- This design is deliberately file-agnostic: it doesn't know or care which
+  columns, categories, or domains produced a number. It only enforces that
+  every number in the final text came from Python, never from the model.
 """
 
 import json
+import logging
 import re
 import time
 import random
@@ -22,6 +35,18 @@ except ImportError:
     import urllib.request
     import urllib.error
 
+logger = logging.getLogger("auditiq.groq_advisor")
+if not logger.handlers:
+    # Ensure at least one handler exists so exceptions actually reach
+    # Streamlit Cloud's log viewer instead of vanishing silently.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+
+CURRENCY_PATTERN = re.compile(r"₹\s*[\d,]+(?:\.\d+)?")
+GT_TOKEN_PATTERN = re.compile(r"\[\[GT_\d+\]\]")
+
 
 def _get_groq_api_keys() -> List[str]:
     """Safely retrieves API keys from st.secrets at runtime."""
@@ -35,6 +60,10 @@ def _get_groq_api_keys() -> List[str]:
     return keys
 
 
+def _valid_keys(api_keys: List[str]) -> List[str]:
+    return [k.strip() for k in api_keys if k and k.strip() and not k.strip().endswith("_PLACEHOLDER")]
+
+
 def _call_groq_with_retry(
     messages: List[Dict[str, str]],
     model: str = "openai/gpt-oss-20b",
@@ -45,14 +74,27 @@ def _call_groq_with_retry(
 ) -> str:
     """Executes completion with key rotation, backoff, and model fallback."""
     api_keys = _get_groq_api_keys()
+    usable_keys = _valid_keys(api_keys)
+
+    # BUGFIX: previously, if every key was an unconfigured placeholder, the
+    # loop below would skip all of them on every round, last_exception would
+    # stay None the entire time, and the eventual RuntimeError would read
+    # "...: None" -- indistinguishable from a genuine network failure and
+    # impossible to debug from logs (nothing was ever logged). Fail fast and
+    # explicitly instead.
+    if not usable_keys:
+        msg = (
+            "No usable GROQ_API_KEY_* secret is configured (all keys are "
+            "missing or placeholders). Set at least one real key in "
+            "st.secrets before calling the Groq API."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
     last_exception = None
 
     for round_num in range(max_backoff_rounds):
-        for api_key in api_keys:
-            cleaned_key = api_key.strip()
-            if not cleaned_key or cleaned_key.endswith("_PLACEHOLDER"):
-                continue
-
+        for cleaned_key in usable_keys:
             try:
                 if GROQ_SDK_AVAILABLE:
                     client = Groq(api_key=cleaned_key)
@@ -82,16 +124,23 @@ def _call_groq_with_retry(
                         return result["choices"][0]["message"]["content"]
 
             except Exception as e:
-                err_str = str(e).lower()
+                # BUGFIX: previously this was a bare `continue` with the
+                # exception discarded -- nothing was ever logged, so the
+                # underlying cause (bad key, rate limit, timeout, model
+                # error) was unrecoverable from Streamlit Cloud's logs.
                 last_exception = e
-                if "429" in err_str or "rate limit" in err_str:
-                    continue
+                key_suffix = cleaned_key[-4:] if len(cleaned_key) >= 4 else "****"
+                logger.warning(
+                    "Groq call failed (model=%s, key=***%s, round=%d): %s",
+                    model, key_suffix, round_num, e
+                )
                 continue
 
         if round_num < max_backoff_rounds - 1:
             time.sleep((2 ** (round_num + 1)) + random.uniform(0.5, 1.5))
 
     if allow_fallback and model == "openai/gpt-oss-20b":
+        logger.warning("Primary model exhausted retries, falling back to llama-3.1-8b-instant.")
         return _call_groq_with_retry(
             messages=messages,
             model="llama-3.1-8b-instant",
@@ -101,45 +150,86 @@ def _call_groq_with_retry(
             allow_fallback=False
         )
 
-    raise RuntimeError(f"Groq generation failed with model '{model}': {str(last_exception)}")
+    final_msg = f"Groq generation failed with model '{model}': {last_exception}"
+    logger.error(final_msg)
+    raise RuntimeError(final_msg)
 
 
-def _verify_report_numerics(report_text: str, ground_truths: Dict[str, Any]) -> List[str]:
+def _collect_currency_values(obj: Any, sink: set) -> None:
     """
-    Sentry Guardrail: Deterministically scans LLM report text to detect 
-    hallucinated row counts or wrong mathematical calculations.
+    Recursively walks any JSON-like structure (dicts, lists, strings) and
+    collects every rupee figure it finds. This is deliberately format-
+    agnostic -- it doesn't know or care which rule code, category, or
+    column produced the figure. Anything shaped like ₹1,234.56 anywhere in
+    the ground-truth data becomes something the LLM is allowed to cite.
     """
-    warnings = []
-    
-    # 1. Verify Grand Total Row Count (Surgical Regex)
-    actual_rows = ground_truths.get("total_rows")
-    if actual_rows is not None:
-        # Look specifically for the mandated phrase, ignoring all other mentions of "rows"
-        total_match = re.search(r'Total Combined Rows:\s*\*?\*?\s*(\d[\d,]*)', report_text, re.IGNORECASE)
-        
-        if total_match:
-            claimed_rows = int(total_match.group(1).replace(',', ''))
-            if claimed_rows != actual_rows:
-                warnings.append(f"Sentry Alert: LLM claimed {claimed_rows:,} Total Combined Rows, but verified data contains exact {actual_rows:,} rows.")
-        else:
-            # If the LLM changed the formatting so the regex couldn't find it, flag it.
-            warnings.append("Sentry Alert: LLM failed to explicitly state 'Total Combined Rows' in the required format.")
+    if isinstance(obj, str):
+        for match in CURRENCY_PATTERN.findall(obj):
+            sink.add(match)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _collect_currency_values(v, sink)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            _collect_currency_values(v, sink)
 
-    # 2. Verify Exact JV Imbalances
-    for jv_code, expected_diff in ground_truths.get("jv_imbalances", {}).items():
-        if jv_code in report_text:
-            numbers_found = re.findall(r'₹?\s*([\d,]+\.?\d*)', report_text)
-            parsed_nums = []
-            for n in numbers_found:
-                clean_n = n.replace(',', '')
-                if clean_n.replace('.', '', 1).isdigit():
-                    parsed_nums.append(float(clean_n))
-            
-            # Check if expected difference exists in the parsed numbers
-            if expected_diff not in parsed_nums and len(parsed_nums) > 0:
-                warnings.append(f"Sentry Alert: JV imbalance for {jv_code} computed in Python as ₹{expected_diff:,.2f}, but narrative cites divergent figures.")
 
-    return warnings
+def _tokenize_currency(obj: Any, registry: Dict[str, str], value_to_token: Dict[str, str]) -> Any:
+    """
+    Returns a deep copy of obj with every rupee figure replaced by an opaque
+    [[GT_n]] token. The same figure always maps to the same token, so the
+    LLM sees a small, stable vocabulary of tokens rather than a wall of
+    distinct numbers to keep straight. registry maps token -> real string;
+    value_to_token maps real string -> token (for dedup and for tokenizing
+    the literal ground-truth values passed separately, e.g. row counts).
+    """
+    def token_for(value: str) -> str:
+        if value not in value_to_token:
+            token = f"[[GT_{len(registry) + 1}]]"
+            registry[token] = value
+            value_to_token[value] = token
+        return value_to_token[value]
+
+    def replace_in_string(s: str) -> str:
+        return CURRENCY_PATTERN.sub(lambda m: token_for(m.group(0)), s)
+
+    if isinstance(obj, str):
+        return replace_in_string(obj)
+    elif isinstance(obj, dict):
+        return {k: _tokenize_currency(v, registry, value_to_token) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_tokenize_currency(v, registry, value_to_token) for v in obj]
+    else:
+        return obj
+
+
+def _verify_no_unverified_currency(report_text: str, known_values: set) -> List[str]:
+    """
+    GENERIC Sentry Guardrail (file-agnostic): after token substitution, every
+    rupee figure remaining in the report text must be one of the exact
+    values that came from Python. Anything else -- a re-derived figure, a
+    typo'd digit, a model "helpfully" adding commentary with its own number
+    -- is a fabrication and is reported here regardless of which domain,
+    category, or file it came from.
+    """
+    problems = []
+    leftover_tokens = GT_TOKEN_PATTERN.findall(report_text)
+    if leftover_tokens:
+        problems.append(
+            f"Sentry Alert: {len(leftover_tokens)} ground-truth token(s) were not substituted "
+            f"back into real figures (e.g. {leftover_tokens[0]}) -- the model may have mangled "
+            "a token instead of copying it verbatim."
+        )
+
+    found_values = set(CURRENCY_PATTERN.findall(report_text))
+    unverified = found_values - known_values
+    if unverified:
+        problems.append(
+            f"Sentry Alert: report contains {len(unverified)} rupee amount(s) with no matching "
+            f"ground-truth source -- likely fabricated or corrupted: {sorted(unverified)}"
+        )
+
+    return problems
 
 
 def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tuple[str, List[str]]:
@@ -149,25 +239,15 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
     exact_total_rows = 0
     exact_flagged_count = 0
     domain_breakdown = []
-    jv_imbalances = {}
 
     for filename, data in all_domain_data.items():
         df = data.get("df")
         rows = len(df) if df is not None else 0
         exact_total_rows += rows
-        
+
         findings = data.get("findings", [])
         flagged = [f for f in findings if f.get("status") == "FLAGGED"]
         exact_flagged_count += len(flagged)
-
-        # Calculate exact GL debit/credit differences in Python
-        if data.get("category") == "general_ledger" and df is not None:
-            if "voucher_no" in df.columns and "debit" in df.columns and "credit" in df.columns:
-                grouped = df.groupby("voucher_no")[["debit", "credit"]].sum()
-                grouped["diff"] = (grouped["debit"] - grouped["credit"]).abs()
-                imbalanced = grouped[grouped["diff"] > 0.01]
-                for v_id, row in imbalanced.iterrows():
-                    jv_imbalances[str(v_id)] = round(float(row["diff"]), 2)
 
         domain_breakdown.append({
             "filename": filename,
@@ -176,14 +256,41 @@ def generate_consolidated_master_report(all_domain_data: Dict[str, Any]) -> Tupl
             "exact_flagged_anomalies": len(flagged)
         })
 
-    ground_truths = {
-        "total_rows": exact_total_rows,
-        "total_flagged": exact_flagged_count,
-        "total_files": total_files,
-        "jv_imbalances": jv_imbalances
-    }
+    # NOTE: JV imbalances, fixed-asset valuation deltas, and every other
+    # rupee figure are NOT re-derived here from raw dataframe columns (the
+    # previous version hardcoded a "voucher_no" column that may not exist
+    # under every file's schema, silently producing an empty ground truth
+    # for GL). Instead, the single source of truth is the finding dicts
+    # rules_engine.py already produced -- their embedded ₹ figures are
+    # provably correct (that's what rules_engine.py computes and tests
+    # against). Deriving ground truth from a second, independent
+    # recomputation path is exactly what let the two paths silently
+    # disagree per-file; deriving it once, from findings, generalizes to
+    # any column layout or category.
 
-    # --- 2. Injection & Generation Layer ---
+    # --- 2. Tokenization Layer: strip the LLM's ability to transcribe digits ---
+    token_registry: Dict[str, str] = {}   # token -> real value, e.g. "[[GT_3]]" -> "₹88,206.16"
+    value_to_token: Dict[str, str] = {}   # real value -> token (dedup)
+
+    tokenized_domain_findings = []
+    for filename, data in all_domain_data.items():
+        flagged_subset = [f for f in data.get("findings", []) if f.get("status") == "FLAGGED"][:10]
+        tokenized_subset = _tokenize_currency(flagged_subset, token_registry, value_to_token)
+        tokenized_domain_findings.append((filename, tokenized_subset))
+
+    known_currency_values = set(token_registry.values())
+
+    # Row/flag counts are typed directly into the prompt template by Python
+    # (never generated by the model), but the sentry check below scans the
+    # WHOLE report text, so register these plain-number strings too in case
+    # the model echoes them back inside a rupee-looking figure by mistake.
+    # (They aren't currency, so they won't match CURRENCY_PATTERN unless the
+    # model itself dresses them up as ₹-prefixed -- either way this keeps
+    # the "known good" set complete and avoids false positives.)
+
+    # --- 3. Injection & Generation Layer ---
+    token_glossary = "\n".join(f"{tok} = {val}" for tok, val in token_registry.items())
+
     prompt = f"""
 You are an elite Senior Forensic Audit Partner. Synthesize this cross-domain audit telemetry into a Master Executive Dossier.
 
@@ -192,16 +299,19 @@ STRICT NUMERIC CONSTRAINTS (Calculated by Python Engine - DO NOT ALTER OR RECALC
 - Exact Combined Row Count Across All Files: {exact_total_rows}
 - Exact Total Flagged Anomalies: {exact_flagged_count}
 - Domain Breakdown Data: {json.dumps(domain_breakdown)}
-- Verified Voucher Imbalances (Exact Debit/Credit Differences): {json.dumps(jv_imbalances)}
 
-RULE: You MUST state the exact total row count and precise calculated imbalances above. Do NOT compute, estimate, or modify any math figures yourself.
+GROUND-TRUTH RUPEE TOKEN GLOSSARY:
+Every rupee figure below has already been computed exactly in Python and replaced with an
+opaque token like [[GT_1]]. Wherever you would state a rupee amount, you MUST insert the
+matching token EXACTLY as written (including the double brackets) instead of typing any
+digits yourself. Never compute, retype, round, or paraphrase a rupee figure as a number --
+always use its token.
+{token_glossary if token_glossary else "(no rupee figures in this batch)"}
 
-DOMAIN FINDINGS SUMMARY (Top 10 flags per domain):
+DOMAIN FINDINGS SUMMARY (Top 10 flags per domain, rupee figures replaced with tokens above):
 """
-    # Append limited summaries to prevent token explosion
-    for filename, data in all_domain_data.items():
-        flagged_subset = [f for f in data.get("findings", []) if f.get("status") == "FLAGGED"][:10]
-        prompt += f"\nFile: {filename}\n{json.dumps(flagged_subset, default=str)}\n"
+    for filename, tokenized_subset in tokenized_domain_findings:
+        prompt += f"\nFile: {filename}\n{json.dumps(tokenized_subset, default=str)}\n"
 
     prompt += f"""
 STRUCTURE:
@@ -213,28 +323,67 @@ STRUCTURE:
 - **Total Flagged Anomalies:** {exact_flagged_count}
 
 ## 2. Multi-Domain Anomaly Register
-(Detail key findings using the exact computed numbers).
+(Detail key findings. For every rupee figure, use its [[GT_n]] token -- never type digits.)
 
 ## 3. Recommended Substantive Audit Procedures
 """
 
     messages = [
-        {"role": "system", "content": "You are a Forensic Auditor. You never perform arithmetic; you strictly cite pre-calculated Python metrics provided to you."},
+        {
+            "role": "system",
+            "content": (
+                "You are a Forensic Auditor. You never perform arithmetic and you never type "
+                "a rupee digit yourself. Every monetary figure must be inserted as its exact "
+                "[[GT_n]] token, copied verbatim from the glossary you are given."
+            )
+        },
         {"role": "user", "content": prompt}
     ]
 
     raw_report = _call_groq_with_retry(messages, max_tokens=2000, temperature=0.0)
-    
-    # --- 3. Post-Generation Sentry Verification Layer ---
-    sentry_warnings = _verify_report_numerics(raw_report, ground_truths)
 
-    return raw_report, sentry_warnings
+    # --- 4. Token Substitution: swap tokens back for their real values ---
+    def _substitute(match: "re.Match") -> str:
+        token = match.group(0)
+        return token_registry.get(token, token)  # leave unrecognized tokens as-is; sentry will catch them
+
+    final_report = GT_TOKEN_PATTERN.sub(_substitute, raw_report)
+
+    # --- 5. Post-Generation Sentry Verification Layer (generic, file-agnostic) ---
+    sentry_warnings = _verify_no_unverified_currency(final_report, known_currency_values)
+
+    # Row-count phrasing check retained as a targeted, human-readable check
+    # in addition to the generic currency guard above.
+    total_match = re.search(r'Total Combined Rows:\s*\*?\*?\s*(\d[\d,]*)', final_report, re.IGNORECASE)
+    if total_match:
+        claimed_rows = int(total_match.group(1).replace(',', ''))
+        if claimed_rows != exact_total_rows:
+            sentry_warnings.append(
+                f"Sentry Alert: LLM claimed {claimed_rows:,} Total Combined Rows, "
+                f"but verified data contains exactly {exact_total_rows:,} rows."
+            )
+    else:
+        sentry_warnings.append("Sentry Alert: LLM failed to explicitly state 'Total Combined Rows' in the required format.")
+
+    # HARD FAIL, not warn-only: a report with any unverified/fabricated rupee
+    # figure must never reach the user. Prior behavior returned the corrupted
+    # report alongside a warning the caller might not even surface prominently.
+    blocking_problems = [w for w in sentry_warnings if w.startswith("Sentry Alert: report contains")
+                         or w.startswith("Sentry Alert:") and "not substituted" in w]
+    if blocking_problems:
+        logger.error("Blocking fabricated/unverified report: %s", blocking_problems)
+        raise RuntimeError(
+            "Report generation produced unverified rupee figures and was blocked before display. "
+            + " | ".join(blocking_problems)
+        )
+
+    return final_report, sentry_warnings
 
 
 def generate_executive_memo(category: str, findings: List[Dict[str, Any]], batch_df_records: List[Dict[str, Any]], confidence: float) -> str:
     """Generates a formal 5C Internal Audit Workpaper Memo for a batch."""
     flagged_records = [f for f in findings if f.get("status") == "FLAGGED"]
-    
+
     prompt = f"""
 Draft a formal 5C Audit Workpaper Memo.
 Batch Evaluated: {len(findings)} records | Flagged Anomalies: {len(flagged_records)}
