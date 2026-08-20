@@ -1,17 +1,21 @@
 """
 groq_advisor.py - AI Report & Memo Synthesis for AuditIQ
 
-Report generation strategy (rewritten):
-- Section 1 (Executive Summary) is built with plain Python, not the LLM.
-  These are counts/sums you already computed - there is no reason to let
-  an LLM restate them and risk transcription errors.
-- Section 2 (Anomaly Register) is generated ONE DOMAIN AT A TIME. Smaller
-  payload in, smaller table out, per call - this is what actually fixes
-  truncation, rather than just raising max_tokens and hoping.
-- Section 3 (Recommended Procedures) is one short LLM call scoped only to
-  the domains actually present.
-- Every LLM-generated chunk is passed through check_sentry_integrity and
-  retried up to max_retries times before being accepted.
+Report generation strategy (final):
+- Section 1 (Executive Summary) - pure Python. No LLM involvement.
+- Section 2 (Anomaly Register)  - pure Python. Built directly from the
+  findings list that rules_engine.py already produced. The LLM never
+  sees this section and cannot add rows, rule codes, or figures to it -
+  there is nothing generative here, only formatting of real data.
+- Section 3 (Recommended Procedures) - the ONLY part the LLM writes.
+  It is narrative commentary, explicitly forbidden from citing rule
+  codes, currency figures, or specific numbers. Its output is checked
+  against a whitelist of real rule codes actually present in the data;
+  if it invents one anyway, that chunk is discarded and retried.
+
+This removes the LLM from every place a hallucination previously showed
+up (fabricated ₹50,000 thresholds, invented TXN-003/AST-003 rules,
+stray "GT token" columns) by construction, not by instruction.
 """
 
 import os
@@ -20,6 +24,24 @@ import json
 from groq import Groq
 
 MODEL_NAME = "llama-3.3-70b-versatile"
+
+# The full set of rule codes rules_engine.py can ever produce. Keep this
+# in sync with rules_engine.py - if you add a new rule there, add its
+# code here too, or the Section 3 whitelist check will reject mentions
+# of it (which is a safe failure direction, but worth keeping current).
+KNOWN_RULE_CODES = {
+    "TXN-001", "TXN-002", "TXN-004",
+    "AGE-001", "AGE-003",
+    "GL-001", "GL-002",
+    "AST-001", "AST-002",
+}
+
+DOMAIN_DISPLAY_NAMES = {
+    "transactions": "Transactions",
+    "ar_ap_aging": "Accounts Receivable / Accounts Payable Aging",
+    "general_ledger": "General Ledger",
+    "fixed_assets": "Fixed Assets",
+}
 
 
 def get_groq_client():
@@ -36,59 +58,17 @@ def format_currency(val: float) -> str:
 
 
 # ---------------------------------------------------------------
-# Sentry integrity check (formatting + grounding, unified)
-# ---------------------------------------------------------------
-
-def check_sentry_integrity(text: str, formatted_findings: list) -> list:
-    """
-    Extracts every currency figure in `text` and checks:
-      (a) formatted with exactly two decimal places
-      (b) numeric value matches a real amount from formatted_findings
-
-    Returns a list of {"figure": str, "issue": str} dicts. Empty = clean.
-    """
-    valid_values = set()
-    for f in formatted_findings:
-        for key in ("formatted_amount", "formatted_debit", "formatted_credit",
-                    "formatted_book_value", "formatted_cost"):
-            v = f.get(key)
-            if v and v != "N/A":
-                try:
-                    valid_values.add(round(float(v.replace("₹", "").replace(",", "")), 2))
-                except ValueError:
-                    continue
-
-    pattern = r'₹\d{1,3}(?:,\d{3})*(?:\.\d+)?'
-    problems = []
-    for m in re.finditer(pattern, text):
-        raw = m.group(0)
-        numeric_str = raw.replace("₹", "").replace(",", "")
-        try:
-            val = round(float(numeric_str), 2)
-        except ValueError:
-            problems.append({"figure": raw, "issue": "unparseable"})
-            continue
-
-        has_two_decimals = "." in raw and len(raw.split(".")[-1]) == 2
-        is_grounded = val in valid_values
-
-        if not has_two_decimals:
-            problems.append({"figure": raw, "issue": "missing_decimals"})
-        if not is_grounded:
-            problems.append({"figure": raw, "issue": "not_in_source_data"})
-
-    return problems
-
-
-# ---------------------------------------------------------------
 # Data prep - shared by all sections
 # ---------------------------------------------------------------
 
 def _build_domain_payload(all_domain_data: dict):
     """
-    Groups formatted_findings by domain and returns:
+    Groups real findings by domain and returns:
       summary_stats: list of per-file row/anomaly counts
       by_domain: {domain_name: [finding_dict, ...]}
+    Each finding_dict already carries a pre-formatted "detected_value"
+    string built directly from rules_engine.py's output - nothing here
+    is inferred or generated, only reshaped.
     """
     summary_stats = []
     by_domain = {}
@@ -109,33 +89,45 @@ def _build_domain_payload(all_domain_data: dict):
         by_domain.setdefault(domain, [])
 
         for item in findings:
-            if item.get("status") == "FLAGGED":
-                for flag in item.get("flags", []):
-                    amt = flag.get("amount", 0.0)
-                    entry = {
-                        "domain": domain,
-                        "row_index": item.get("row_index"),
-                        "rule_code": flag.get("rule_code"),
-                        "severity": flag.get("severity"),
-                        "description": flag.get("description"),
-                        "formatted_amount": format_currency(amt) if amt > 0 else "N/A",
-                        "remediation": flag.get("remediation", "Review supporting documentation.")
-                    }
-                    for src_key, dst_key in [
-                        ("debit", "formatted_debit"),
-                        ("credit", "formatted_credit"),
-                        ("book_value", "formatted_book_value"),
-                        ("cost", "formatted_cost"),
-                    ]:
-                        if src_key in flag:
-                            entry[dst_key] = format_currency(flag[src_key])
-                    by_domain[domain].append(entry)
+            if item.get("status") != "FLAGGED":
+                continue
+            for flag in item.get("flags", []):
+                rule_code = flag.get("rule_code", "UNKNOWN")
+                amt = flag.get("amount", 0.0)
+
+                # Build a "Detected Value" string from whatever this
+                # specific rule actually attached to the flag. This is
+                # the only place formatting decisions happen, and it's
+                # deterministic per rule_code - no LLM judgment involved.
+                if rule_code == "GL-001":
+                    detected_value = (
+                        f"Dr: {format_currency(flag.get('debit', 0.0))} / "
+                        f"Cr: {format_currency(flag.get('credit', 0.0))}"
+                    )
+                elif rule_code == "AST-002":
+                    detected_value = (
+                        f"Book Value: {format_currency(flag.get('book_value', 0.0))} "
+                        f"> Cost: {format_currency(flag.get('cost', 0.0))}"
+                    )
+                elif amt and amt > 0:
+                    detected_value = format_currency(amt)
+                else:
+                    detected_value = "N/A"
+
+                by_domain[domain].append({
+                    "row_index": item.get("row_index"),
+                    "rule_code": rule_code,
+                    "severity": flag.get("severity", "HIGH"),
+                    "description": flag.get("description", ""),
+                    "detected_value": detected_value,
+                    "remediation": flag.get("remediation", "Review supporting documentation."),
+                })
 
     return summary_stats, by_domain
 
 
 # ---------------------------------------------------------------
-# Section 1 - pure Python, no LLM, cannot hallucinate or truncate
+# Section 1 - pure Python
 # ---------------------------------------------------------------
 
 def _render_section_1(summary_stats: list) -> str:
@@ -154,131 +146,119 @@ def _render_section_1(summary_stats: list) -> str:
         "|--------|------------|--------------------------|",
     ]
     for s in summary_stats:
-        lines.append(f"| {s['domain']} | {s['rows']} | {s['flagged_anomalies']} |")
+        display = DOMAIN_DISPLAY_NAMES.get(s["domain"], s["domain"])
+        lines.append(f"| {display} | {s['rows']} | {s['flagged_anomalies']} |")
 
     lines.append("")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------
-# Section 2 - one Groq call per domain
+# Section 2 - pure Python, no LLM call at all
 # ---------------------------------------------------------------
 
-DOMAIN_DISPLAY_NAMES = {
-    "transactions": "Transactions",
-    "ar_ap_aging": "Accounts Receivable / Accounts Payable Aging",
-    "general_ledger": "General Ledger",
-    "fixed_assets": "Fixed Assets",
-}
-
-SECTION_2_SYSTEM_PROMPT = """You are an Executive Forensic Auditor writing one section of an Audit Master Dossier.
-You will render a single Markdown table for ONE domain only.
-
-CRITICAL SENTRY VERIFICATION CONSTRAINTS:
-1. ALWAYS format every currency figure with exactly two decimal places (e.g. '₹60,000.00'). Never write '₹60,000' or '₹60000'.
-2. NEVER invent, estimate, or state a rule threshold, limit, or benchmark figure unless that exact number appears verbatim in the supplied JSON. If a finding's description has no numeric threshold in the JSON, describe it qualitatively with no number attached.
-3. Do NOT include any internal metadata columns (debug tokens, ground-truth tokens, QA fields, "GT Token", "[[GT_n]]", etc.) - only the columns requested.
-4. Render the table completely. Do not truncate or cut off mid-row.
-5. Every currency figure you write MUST be copied character-for-character from a "formatted_amount", "formatted_debit", "formatted_credit", "formatted_book_value", or "formatted_cost" value in the JSON. Never compute or restate a number from memory.
-"""
+def _escape_md(text: str) -> str:
+    """Escapes pipe characters so a value can't break a Markdown table row."""
+    return str(text).replace("|", "\\|")
 
 
-def _render_section_2_domain(client, domain: str, findings: list, max_retries: int) -> tuple:
-    """Generates the Markdown table for a single domain. Returns (markdown, warnings)."""
+def _render_section_2_domain(domain: str, findings: list) -> str:
     display_name = DOMAIN_DISPLAY_NAMES.get(domain, domain)
 
     if not findings:
-        return f"### {display_name}\n\n_No flagged anomalies in this domain._\n", []
+        return f"### {display_name}\n\n_No flagged anomalies in this domain._\n"
 
-    user_prompt = f"""Render a Markdown table of flagged anomalies for the "{display_name}" domain only.
+    lines = [
+        f"### {display_name}",
+        "",
+        "| Row | Rule | Severity | Finding | Detected Value | Remediation |",
+        "|-----|------|----------|---------|-----------------|-------------|",
+    ]
+    for f in findings:
+        lines.append(
+            f"| {f['row_index']} | {f['rule_code']} | {f['severity']} "
+            f"| {_escape_md(f['description'])} | {_escape_md(f['detected_value'])} "
+            f"| {_escape_md(f['remediation'])} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
-Columns required, in order: Row, Rule, Severity, Finding, Detected Value, Remediation.
 
-Data:
-{json.dumps(findings, indent=2)}
+def _render_section_2(by_domain: dict) -> str:
+    parts = ["## 2. Multi-Domain Anomaly Register", ""]
 
-Output ONLY a "### {display_name}" heading followed by the Markdown table. No other text.
+    for domain in DOMAIN_DISPLAY_NAMES:
+        if domain not in by_domain:
+            continue
+        parts.append(_render_section_2_domain(domain, by_domain[domain]))
+
+    for domain, findings in by_domain.items():
+        if domain not in DOMAIN_DISPLAY_NAMES:
+            parts.append(_render_section_2_domain(domain, findings))
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------
+# Section 3 - the ONLY LLM call. Narrative only, no numbers, no
+# rule-code fabrication allowed.
+# ---------------------------------------------------------------
+
+def _check_section_3(text: str) -> list:
+    """
+    Section 3 must not contain currency figures or invented rule codes.
+    Returns a list of problems found (empty = clean).
+    """
+    problems = []
+
+    if re.search(r'₹\d', text):
+        problems.append("Section 3 contains a currency figure, which is not allowed.")
+
+    mentioned_codes = set(re.findall(r'\b[A-Z]{2,4}-\d{3}\b', text))
+    invented = mentioned_codes - KNOWN_RULE_CODES
+    if invented:
+        problems.append(f"Section 3 references unknown rule code(s): {sorted(invented)}")
+
+    return problems
+
+
+def _render_section_3(client, by_domain: dict, max_retries: int = 1) -> tuple:
+    domains_present = [DOMAIN_DISPLAY_NAMES.get(d, d) for d in by_domain if by_domain[d]]
+    if not domains_present:
+        return "## 3. Recommended Substantive Audit Procedures\n\n_No flagged anomalies requiring follow-up._\n", []
+
+    prompt = f"""Write "## 3. Recommended Substantive Audit Procedures" as a numbered action plan for a forensic audit dossier.
+
+Cover only these domains, which had flagged anomalies: {', '.join(domains_present)}.
+
+Strict rules:
+- Do NOT mention any currency amount or numeric threshold anywhere.
+- Do NOT reference any rule code (e.g. "TXN-001") - discuss domains and general control weaknesses only, not specific rule identifiers.
+- Do NOT invent new categories of risk beyond what a normal audit review of these domains would cover.
+- Keep it concise: 1-2 sentences per domain.
 """
 
     warnings = []
     text = ""
-    finish_reason = None
     attempt = 0
 
     while attempt <= max_retries:
         response = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SECTION_2_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
             temperature=0.1
         )
         text = response.choices[0].message.content
-        finish_reason = response.choices[0].finish_reason
-
-        issues = check_sentry_integrity(text, findings)
-        if not issues and finish_reason != "length":
+        issues = _check_section_3(text)
+        if not issues:
             return text, []
-
         attempt += 1
 
-    # Ran out of retries - return best attempt with warnings attached
-    if finish_reason == "length":
-        warnings.append(f"[{display_name}] generation truncated by max_tokens.")
-    issues = check_sentry_integrity(text, findings)
+    issues = _check_section_3(text)
     if issues:
-        warnings.append(f"[{display_name}] Sentry integrity check failed: {issues}")
-
+        warnings.append(f"Section 3 integrity check failed after retries: {issues}")
     return text, warnings
-
-
-def _render_section_2(client, by_domain: dict, max_retries: int) -> tuple:
-    parts = ["## 2. Multi-Domain Anomaly Register", ""]
-    all_warnings = []
-
-    for domain in DOMAIN_DISPLAY_NAMES:
-        if domain not in by_domain:
-            continue
-        findings = by_domain[domain]
-        table_md, warnings = _render_section_2_domain(client, domain, findings, max_retries)
-        parts.append(table_md)
-        parts.append("")
-        all_warnings.extend(warnings)
-
-    # Any domain present in data but not in our known display-name map
-    for domain, findings in by_domain.items():
-        if domain not in DOMAIN_DISPLAY_NAMES:
-            table_md, warnings = _render_section_2_domain(client, domain, findings, max_retries)
-            parts.append(table_md)
-            parts.append("")
-            all_warnings.extend(warnings)
-
-    return "\n".join(parts), all_warnings
-
-
-# ---------------------------------------------------------------
-# Section 3 - one short LLM call, scoped to domains present
-# ---------------------------------------------------------------
-
-def _render_section_3(client, by_domain: dict) -> str:
-    domains_present = [DOMAIN_DISPLAY_NAMES.get(d, d) for d in by_domain if by_domain[d]]
-    if not domains_present:
-        return "## 3. Recommended Substantive Audit Procedures\n\n_No flagged anomalies requiring follow-up._\n"
-
-    prompt = f"""Write "## 3. Recommended Substantive Audit Procedures" as a numbered action plan for a forensic audit dossier.
-Cover only these domains, which had flagged anomalies: {', '.join(domains_present)}.
-Do not mention specific currency amounts or numeric thresholds - this section is procedural guidance only, not a restatement of figures.
-Keep it concise: 1-2 sentences per domain.
-"""
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
-        temperature=0.2
-    )
-    return response.choices[0].message.content
 
 
 # ---------------------------------------------------------------
@@ -295,8 +275,8 @@ def generate_consolidated_master_report(all_domain_data: dict, max_retries: int 
     summary_stats, by_domain = _build_domain_payload(all_domain_data)
 
     section_1 = _render_section_1(summary_stats)
-    section_2, warnings_2 = _render_section_2(client, by_domain, max_retries)
-    section_3 = _render_section_3(client, by_domain)
+    section_2 = _render_section_2(by_domain)  # pure Python, no warnings possible
+    section_3, warnings_3 = _render_section_3(client, by_domain, max_retries)
 
     report_text = (
         "# FORENSIC AUDIT EXECUTIVE DOSSIER\n\n"
@@ -305,7 +285,7 @@ def generate_consolidated_master_report(all_domain_data: dict, max_retries: int 
         + section_3
     )
 
-    return report_text, warnings_2
+    return report_text, warnings_3
 
 
 # ---------------------------------------------------------------
