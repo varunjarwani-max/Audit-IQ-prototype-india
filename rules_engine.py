@@ -5,10 +5,11 @@ Optimized for zero-latency execution on 10,000+ row files using boolean vector m
 Includes parameterized and dynamic reference dates for aging and fixed asset schedules.
 """
 
+import re
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Union, Set
 
 
 def audit_transactions(
@@ -579,3 +580,29 @@ def audit_fixed_assets(
         })
 
     return findings
+
+
+def verify_report_amounts(findings: List[Dict[str, Any]], report_text: str) -> None:
+    """
+    Boundary Verification Guard:
+    Extracts every ₹ figure quoted in the rendered report and confirms it
+    appears verbatim somewhere in the source findings. Any amount in the
+    report that isn't traceable to a finding is a fabrication/corruption
+    and must fail loudly, regardless of which file or module produced it.
+    """
+    source_amounts = set()
+    amount_pattern = re.compile(r"₹[\d,]+\.\d{2}")
+    
+    for f in findings:
+        for fl in f.get("flags", []):
+            for field in ("description", "detected_value", "expected"):
+                source_amounts.update(amount_pattern.findall(fl.get(field, "")))
+
+    report_amounts = set(amount_pattern.findall(report_text))
+    unverified = report_amounts - source_amounts
+    
+    if unverified:
+        raise AssertionError(
+            f"Report contains {len(unverified)} rupee amount(s) with no "
+            f"matching source finding — possible fabrication/corruption: {unverified}"
+        )
