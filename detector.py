@@ -26,43 +26,43 @@ ALIAS_DEFINITIONS = {
     "ar_ap_aging": {
         "display_name": "AR / AP Aging Ledger",
         "module_file": "aging_detection.py",
-        "primary_fields": ["invoice_date", "due_date", "payment_date", "amount", "customer_vendor", "invoice_status"],
+        "primary_fields": ["invoice_date", "due_date", "payment_date", "amount", "counterparty", "invoice_status"],
         "secondary_fields": ["invoice_number", "terms", "aging_bucket", "days_overdue", "currency", "discount"],
         "aliases": {
             "invoice_date": ["invoice_date", "inv_date", "bill_date", "doc_date", "issue_date", "origination_date"],
             "due_date": ["due_date", "maturity_date", "payment_due", "due", "expiry_date", "expected_date"],
             "payment_date": ["payment_date", "paid_date", "settlement_date", "cleared_date", "remittance_date", "paid_on"],
             "amount": ["amount", "invoice_amount", "balance", "outstanding_amount", "open_amount", "total_billed", "net_due"],
-            "customer_vendor": ["customer_vendor", "customer", "vendor", "client", "customer_name", "vendor_name", "debtor", "creditor", "counterparty", "payer"],
+            "counterparty": ["customer_vendor", "customer", "vendor", "client", "customer_name", "vendor_name", "debtor", "creditor", "counterparty", "payer"],
             "invoice_status": ["invoice_status", "status", "payment_status", "aging_status", "state", "inv_status"]
         }
     },
     "general_ledger": {
         "display_name": "General Ledger (GL) Entries",
         "module_file": "gl_detection.py",
-        "primary_fields": ["entry_date", "account_name", "debit", "credit", "journal_reference", "prepared_by"],
+        "primary_fields": ["posting_date", "account_name", "debit", "credit", "voucher_id", "prepared_by"],
         "secondary_fields": ["line_number", "description", "entity_id", "currency", "is_manual", "posted_time"],
         "aliases": {
-            "entry_date": ["entry_date", "posting_date", "je_date", "effective_date", "txn_timestamp", "journal_date"],
+            "posting_date": ["entry_date", "posting_date", "je_date", "effective_date", "txn_timestamp", "journal_date"],
             "account_name": ["account_name", "account_description", "gl_account", "account_title", "account", "ledger_account"],
             "debit": ["debit", "dr", "debit_amount", "dr_amount", "debits"],
             "credit": ["credit", "cr", "credit_amount", "cr_amount", "credits"],
-            "journal_reference": ["journal_reference", "je_number", "ref_number", "journal_id", "batch_id", "voucher_no", "reference", "journal_ref"],
+            "voucher_id": ["journal_reference", "je_number", "ref_number", "journal_id", "batch_id", "voucher_no", "reference", "journal_ref"],
             "prepared_by": ["prepared_by", "created_by", "entered_by", "posted_by", "user_id", "author", "originator"]
         }
     },
     "fixed_assets": {
         "display_name": "Fixed Asset Register",
         "module_file": "fixed_asset_detection.py",
-        "primary_fields": ["asset_name", "purchase_date", "purchase_cost", "depreciation_method", "useful_life", "current_value"],
+        "primary_fields": ["asset_name", "purchase_date", "cost", "method", "useful_life", "book_value"],
         "secondary_fields": ["asset_id", "asset_tag", "serial_number", "accumulated_depreciation", "salvage_value", "location"],
         "aliases": {
             "asset_name": ["asset_name", "asset_description", "equipment_name", "asset_title", "item_name", "asset"],
             "purchase_date": ["purchase_date", "acquisition_date", "capitalization_date", "placed_in_service", "buy_date", "in_service_date"],
-            "purchase_cost": ["purchase_cost", "original_cost", "historical_cost", "acquisition_cost", "asset_cost", "gross_book_value", "cost"],
-            "depreciation_method": ["depreciation_method", "depr_method", "depr_type", "method", "depreciation_type"],
+            "cost": ["purchase_cost", "original_cost", "historical_cost", "acquisition_cost", "asset_cost", "gross_book_value", "cost"],
+            "method": ["depreciation_method", "depr_method", "depr_type", "method", "depreciation_type"],
             "useful_life": ["useful_life", "lifespan", "useful_life_years", "life_years", "est_life", "asset_life"],
-            "current_value": ["current_value", "book_value", "net_book_value", "nbv", "carrying_value", "present_value"]
+            "book_value": ["current_value", "book_value", "net_book_value", "nbv", "carrying_value", "present_value"]
         }
     }
 }
@@ -164,7 +164,7 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
             if not has_dr_cr:
                 score = min(score, 30)
         elif cat == "fixed_assets":
-            has_asset_cost = ("asset_name" in matched_fields) or ("purchase_cost" in matched_fields)
+            has_asset_cost = ("asset_name" in matched_fields) or ("cost" in matched_fields)
             if not has_asset_cost:
                 score = min(score, 30)
         elif cat == "ar_ap_aging":
