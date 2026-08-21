@@ -97,6 +97,12 @@ if "active_file_name" not in st.session_state: st.session_state["active_file_nam
 with st.sidebar:
     st.markdown("### 🛡️ **AuditIQ**")
     st.caption("Data Segregation & Anomaly Routing Engine")
+    
+    # [FIX 4] Restored configurability variables
+    st.markdown("---")
+    st.markdown("### Global Settings")
+    txn_threshold = st.slider("Transaction Anomaly Threshold (₹)", min_value=10000, max_value=500000, value=50000, step=10000)
+    as_of_date = st.date_input("Audit As-Of Date", value=datetime.today())
 
 # ---------------------------------------------------------
 # Main App Header & Multi-File Ingestion
@@ -111,20 +117,32 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    if len(uploaded_files) != len(st.session_state["multi_file_data"]):
+    # [FIX 2] Properly track file set changes by filename instead of just length
+    new_names = {f.name for f in uploaded_files}
+    old_names = set(st.session_state["multi_file_data"].keys())
+    
+    if new_names != old_names:
         st.session_state["multi_file_data"] = {}
         for file in uploaded_files:
             df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
             classification = classify_columns(list(df.columns))
+            
+            # [FIX 1] Expose classification warnings to the user
+            if classification.get("classification_warnings"):
+                for w in classification["classification_warnings"]:
+                    st.warning(f"⚠️ `{file.name}`: {w}")
+            
             category = classification["category"]
             if category == "ambiguous": category = classification["raw_best_category"]
             
             col_map = classification["matched_columns"]
             findings = []
-            if category == "transactions": findings = audit_transactions(df, col_map)
-            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=None)
+            
+            # [FIX 4] Pass correct parameters based on sidebar state
+            if category == "transactions": findings = audit_transactions(df, col_map, threshold_limit=txn_threshold)
+            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=as_of_date)
             elif category == "general_ledger": findings = audit_general_ledger(df, col_map, period_end_days=4)
-            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=None)
+            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=as_of_date)
             
             st.session_state["multi_file_data"][file.name] = {
                 "df": df,
@@ -201,8 +219,20 @@ if st.session_state["multi_file_data"]:
     
     edited_batch_df = st.data_editor(batch_df, use_container_width=True, num_rows="dynamic", key=f"editor_batch_{current_batch_idx}")
     if not edited_batch_df.equals(batch_df):
+        # [FIX 3] Write edit back to the dataframe and re-audit ONLY the active file
         st.session_state["working_df"].iloc[batch_start_idx:batch_end_idx] = edited_batch_df
-        st.session_state["multi_file_data"] = {}
+        updated_df = st.session_state["working_df"]
+        
+        # Re-run rule engine on updated file
+        new_findings = []
+        if active_category == "transactions": new_findings = audit_transactions(updated_df, effective_col_map, threshold_limit=txn_threshold)
+        elif active_category == "ar_ap_aging": new_findings = audit_aging(updated_df, effective_col_map, severe_overdue_days=90, as_of_date=as_of_date)
+        elif active_category == "general_ledger": new_findings = audit_general_ledger(updated_df, effective_col_map, period_end_days=4)
+        elif active_category == "fixed_assets": new_findings = audit_fixed_assets(updated_df, effective_col_map, as_of_date=as_of_date)
+        
+        # Save updates to session state instead of dropping multi_file_data
+        st.session_state["multi_file_data"][st.session_state["active_file_name"]]["df"] = updated_df
+        st.session_state["multi_file_data"][st.session_state["active_file_name"]]["findings"] = new_findings
         st.rerun()
 
     nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
