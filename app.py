@@ -100,7 +100,10 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### Global Settings")
-    txn_threshold = st.slider("Transaction Anomaly Threshold (₹)", min_value=10000, max_value=500000, value=50000, step=10000)
+    # Transaction Anomaly Threshold slider removed -- no user-configurable cap.
+    # txn_threshold is fixed to "no limit" (infinity) so threshold-based checks
+    # (TXN-002/003/004) never impose an arbitrary ceiling by default.
+    txn_threshold = float("inf")
     as_of_date = st.date_input("Audit As-Of Date", value=datetime.today())
 
 # ---------------------------------------------------------
