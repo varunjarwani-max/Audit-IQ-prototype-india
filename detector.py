@@ -85,21 +85,16 @@ def alias_matches_column(alias: str, norm_col: str) -> bool:
     if not alias or not norm_col:
         return False
     
-    # Direct exact match
     if alias == norm_col:
         return True
     
     tokens = norm_col.split('_')
-    
-    # For short aliases (<= 3 characters, e.g. 'dr', 'cr', 'je', 'id', 'nbv', 'inv'), require exact token match
     if len(alias) <= 3:
         return alias in tokens
 
-    # For longer aliases, match whole token
     if alias in tokens:
         return True
     
-    # Word-boundary check: alias must appear surrounded by underscores or string boundaries
     pattern = rf"(^|_){re.escape(alias)}(_|$)"
     if re.search(pattern, norm_col):
         return True
@@ -136,15 +131,12 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
         matched_primary_count = 0
         for std_field in primary_fields:
             field_aliases = [normalize_string(a) for a in aliases.get(std_field, [std_field])]
-            
-            # Find best match in uploaded columns using token matching
             for orig_col, norm_col in normalized_cols.items():
                 if any(alias_matches_column(alias, norm_col) for alias in field_aliases):
                     matched_fields[std_field] = orig_col
                     matched_primary_count += 1
                     break
         
-        # Check secondary headers
         matched_sec_count = 0
         for sec_field in secondary_fields:
             norm_sec = normalize_string(sec_field)
@@ -155,10 +147,8 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
 
         primary_ratio = matched_primary_count / len(primary_fields)
         secondary_ratio = min(1.0, matched_sec_count / 2.0) if secondary_fields else 0.0
-
         score = int(round((primary_ratio * 85.0) + (secondary_ratio * 15.0)))
 
-        # Domain critical penalty floors
         if cat == "general_ledger":
             has_dr_cr = ("debit" in matched_fields) or ("credit" in matched_fields)
             if not has_dr_cr:
