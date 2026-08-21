@@ -1,359 +1,335 @@
 """
-groq_advisor.py - AI Report & Memo Synthesis for AuditIQ
-
-Report generation strategy (final):
-- Section 1 (Executive Summary) - pure Python. No LLM involvement.
-- Section 2 (Anomaly Register)  - pure Python. Built directly from the
-  findings list that rules_engine.py already produced. The LLM never
-  sees this section and cannot add rows, rule codes, or figures to it -
-  there is nothing generative here, only formatting of real data.
-- Section 3 (Recommended Procedures) - the ONLY part the LLM writes.
-  It is narrative commentary, explicitly forbidden from citing rule
-  codes, currency figures, or specific numbers. Its output is checked
-  against a whitelist of real rule codes actually present in the data;
-  if it invents one anyway, that chunk is discarded and retried.
-
-This removes the LLM from every place a hallucination previously showed
-up (fabricated ₹50,000 thresholds, invented TXN-003/AST-003 rules,
-stray "GT token" columns) by construction, not by instruction.
+rules_engine.py - Audit Rule Detection Engine for AuditIQ
 """
-
-import os
-import re
-import json
-import time
-import random
-from groq import Groq
-
-MODEL_NAME = "llama-3.3-70b-versatile"
-
-# The full set of rule codes rules_engine.py can ever produce. Keep this
-# in sync with rules_engine.py - if you add a new rule there, add its
-# code here too, or the Section 3 whitelist check will reject mentions
-# of it (which is a safe failure direction, but worth keeping current).
-KNOWN_RULE_CODES = {
-    "TXN-001", "TXN-002", "TXN-003", "TXN-004",  # Added missing TXN-003 back to whitelist
-    "AGE-001", "AGE-002", "AGE-003",             # Added missing AGE-002 back to whitelist
-    "GL-001", "GL-002",
-    "AST-001", "AST-002", "AST-003",             # Added missing AST-003 back to whitelist
-}
-
-DOMAIN_DISPLAY_NAMES = {
-    "transactions": "Transactions",
-    "ar_ap_aging": "Accounts Receivable / Accounts Payable Aging",
-    "general_ledger": "General Ledger",
-    "fixed_assets": "Fixed Assets",
-}
-
-
-def get_groq_client():
-    """Initializes and returns the Groq API client."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY environment variable is missing.")
-    return Groq(api_key=api_key)
-
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
 def format_currency(val: float) -> str:
-    """Guarantees strict two-decimal currency formatting."""
+    """Utility helper to guarantee strict 2-decimal currency formatting."""
     return f"₹{float(val):,.2f}"
 
 
-# ---------------------------------------------------------------
-# Core API Caller with Exponential Backoff (429 Rate Limit Guard)
-# ---------------------------------------------------------------
-
-def _call_groq_with_backoff(client, messages: list, max_retries: int = 4, temperature: float = 0.1):
+def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: float = 50000.0) -> list:
     """
-    Executes a Groq chat completion with exponential backoff and jitter.
-    Vital for free-tier usage where 429 Rate Limit errors are common.
+    Audits transactions dataset for:
+    - TXN-001: Missing approval sign-off
+    - TXN-002: Exact round figure disbursement (above threshold)
+    - TXN-003: Near-Threshold Structuring
+    - TXN-004: 7-day rolling split-invoicing aggregate
     """
-    base_delay = 1.0
+    results = []
     
-    for attempt in range(max_retries + 1):
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                max_tokens=1024,
-                temperature=temperature
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            err_msg = str(e).lower()
-            if ("429" in err_msg or "rate limit" in err_msg) and attempt < max_retries:
-                # Exponential backoff: 1s, 2s, 4s, 8s + random jitter to prevent thundering herd
-                sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0.1, 1.0)
-                time.sleep(sleep_time)
-            else:
-                # Either out of retries or it's a non-429 error (e.g., auth failure)
-                raise
+    date_col = col_map.get("date", "date") if col_map else "date"
+    amt_col = col_map.get("amount", "amount") if col_map else "amount"
+    vendor_col = col_map.get("vendor", "vendor") if col_map else "vendor"
+    appr_col = col_map.get("approved_by", "approved_by") if col_map else "approved_by"
 
+    df_clean = df.copy()
+    if date_col in df_clean.columns:
+        df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
 
-# ---------------------------------------------------------------
-# Shared Hallucination Guards
-# ---------------------------------------------------------------
+    # Vectorized calculation for TXN-004 (7-Day Split Invoicing)
+    df_clean['rolling_sum'] = 0.0
+    df_clean['rolling_count'] = 0
+    if date_col in df_clean.columns and amt_col in df_clean.columns and vendor_col in df_clean.columns:
+        df_sorted = df_clean.dropna(subset=[date_col]).sort_values(by=[vendor_col, date_col])
+        if not df_sorted.empty:
+            rolling_sums = df_sorted.groupby(vendor_col).rolling('7D', on=date_col)[amt_col].sum().reset_index(level=0, drop=True)
+            rolling_counts = df_sorted.groupby(vendor_col).rolling('7D', on=date_col)[amt_col].count().reset_index(level=0, drop=True)
+            df_clean.loc[df_sorted.index, 'rolling_sum'] = rolling_sums
+            df_clean.loc[df_sorted.index, 'rolling_count'] = rolling_counts
 
-def _check_hallucinations(text: str) -> list:
-    """
-    Ensures generative text does not contain currency figures or invented rule codes.
-    Returns a list of problems found (empty = clean).
-    """
-    problems = []
+    for idx, row in df_clean.iterrows():
+        row_index = idx + 1
+        flags = []
+        amt = float(row[amt_col]) if pd.notnull(row.get(amt_col)) else 0.0
+        vendor = str(row.get(vendor_col, "Unknown Vendor"))
+        appr = str(row.get(appr_col, "")).strip()
 
-    if re.search(r'₹\d', text):
-        problems.append("Text contains a currency figure, which is not allowed.")
+        # TXN-001: Missing approval
+        if not appr or appr.lower() in ["nan", "none", "null", "''", ""]:
+            flags.append({
+                "rule_code": "TXN-001",
+                "rule_name": "Missing Sign-off Approval",
+                "severity": "HIGH",
+                "amount": amt,
+                "description": f"Transaction of {format_currency(amt)} lacks documented authorizing approval sign-off.",
+                "remediation": "Obtain signed physical or digital approval voucher before clearance."
+            })
 
-    mentioned_codes = set(re.findall(r'\b[A-Z]{2,4}-\d{3}\b', text))
-    invented = mentioned_codes - KNOWN_RULE_CODES
-    if invented:
-        problems.append(f"Text references unknown rule code(s): {sorted(invented)}")
+        # TXN-002: Exact round-number disbursement (Threshold enforced)
+        if amt >= threshold_limit and amt % 1000 == 0:
+            flags.append({
+                "rule_code": "TXN-002",
+                "rule_name": "Exact Round-Number Disbursement",
+                "severity": "HIGH",
+                "amount": amt,
+                "description": f"Exact round figure disbursement of {format_currency(amt)} exceeds policy threshold.",
+                "remediation": "Obtain itemized vendor invoice; inspect line-item cost breakdown."
+            })
 
-    return problems
+        # TXN-003: Near-Threshold Structuring
+        if (threshold_limit * 0.95) <= amt < threshold_limit:
+            flags.append({
+                "rule_code": "TXN-003",
+                "rule_name": "Near-Threshold Structuring Risk",
+                "severity": "CRITICAL",
+                "amount": amt,
+                "description": f"Amount {format_currency(amt)} sits suspiciously just below the {format_currency(threshold_limit)} limit.",
+                "remediation": "Verify if multiple similar invoices exist to bypass manager approval limits."
+            })
 
+        # TXN-004: Split Invoicing Detection
+        rolling_count = row.get('rolling_count', 0)
+        rolling_sum = row.get('rolling_sum', 0.0)
+        
+        if rolling_count > 1 and rolling_sum >= threshold_limit:
+            flags.append({
+                "rule_code": "TXN-004",
+                "rule_name": "7-Day Split Invoicing Breach",
+                "severity": "HIGH",
+                "amount": rolling_sum,
+                "description": f"Multiple disbursements to '{vendor}' within 7 days aggregate to {format_currency(rolling_sum)}.",
+                "remediation": "Merge purchase orders & audit against master service agreement limits."
+            })
 
-# ---------------------------------------------------------------
-# Data prep - shared by all sections
-# ---------------------------------------------------------------
-
-def _build_domain_payload(all_domain_data: dict):
-    """
-    Groups real findings by domain and returns:
-      summary_stats: list of per-file row/anomaly counts
-      by_domain: {domain_name: [finding_dict, ...]}
-    Each finding_dict already carries a pre-formatted "detected_value"
-    string built directly from rules_engine.py's output - nothing here
-    is inferred or generated, only reshaped.
-    """
-    summary_stats = []
-    by_domain = {}
-
-    for file_name, file_info in all_domain_data.items():
-        domain = file_info.get("category", "unknown")
-        df = file_info.get("df")
-        findings = file_info.get("findings", [])
-
-        flagged_count = sum(1 for f in findings if f.get("status") == "FLAGGED")
-        summary_stats.append({
-            "file": file_name,
-            "domain": domain,
-            "rows": len(df) if df is not None else 0,
-            "flagged_anomalies": flagged_count
+        results.append({
+            "row_index": row_index,
+            "status": "FLAGGED" if len(flags) > 0 else "CLEARED",
+            "flags": flags
         })
 
-        by_domain.setdefault(domain, [])
+    return results
 
-        for item in findings:
-            if item.get("status") != "FLAGGED":
-                continue
-            for flag in item.get("flags", []):
-                rule_code = flag.get("rule_code", "UNKNOWN")
-                amt = flag.get("amount", 0.0)
 
-                # Build a "Detected Value" string from whatever this
-                # specific rule actually attached to the flag. This is
-                # the only place formatting decisions happen, and it's
-                # deterministic per rule_code - no LLM judgment involved.
-                if rule_code == "GL-001":
-                    detected_value = (
-                        f"Dr: {format_currency(flag.get('debit', 0.0))} / "
-                        f"Cr: {format_currency(flag.get('credit', 0.0))}"
-                    )
-                elif rule_code == "AST-002":
-                    detected_value = (
-                        f"Book Value: {format_currency(flag.get('book_value', 0.0))} "
-                        f"> Cost: {format_currency(flag.get('cost', 0.0))}"
-                    )
-                elif amt and amt > 0:
-                    detected_value = format_currency(amt)
-                else:
-                    detected_value = "N/A"
+def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int = 90, as_of_date: str = None) -> list:
+    """
+    Audits AR/AP Aging dataset for:
+    - AGE-001: Severe overdue invoice
+    - AGE-002: Inverted chronology (Payment before Invoice)
+    - AGE-003: Chronic counterparty delinquency
+    """
+    results = []
+    amt_col = col_map.get("amount", "amount") if col_map else "amount"
+    due_col = col_map.get("due_date", "due_date") if col_map else "due_date"
+    inv_col = col_map.get("invoice_date", "invoice_date") if col_map else "invoice_date"
+    pay_col = col_map.get("payment_date", "payment_date") if col_map else "payment_date"
+    cp_col = col_map.get("counterparty", "counterparty") if col_map else "counterparty"
 
-                by_domain[domain].append({
-                    "row_index": item.get("row_index"),
-                    "rule_code": rule_code,
-                    "severity": flag.get("severity", "HIGH"),
-                    "description": flag.get("description", ""),
-                    "detected_value": detected_value,
-                    "remediation": flag.get("remediation", "Review supporting documentation."),
+    df_clean = df.copy()
+    for col in [due_col, inv_col, pay_col]:
+        if col in df_clean.columns:
+            df_clean[col] = pd.to_datetime(df_clean[col], errors="coerce")
+
+    # Dynamic as_of_date resolution
+    if as_of_date:
+        ref_date = pd.to_datetime(as_of_date)
+    else:
+        max_date = df_clean[due_col].max() if due_col in df_clean.columns else pd.NaT
+        ref_date = max_date if pd.notna(max_date) else pd.to_datetime(datetime.today())
+
+    # Pre-calculate AGE-003: Only count OVERDUE invoices for delinquency
+    cp_overdue_counts = {}
+    if due_col in df_clean.columns and cp_col in df_clean.columns:
+        overdue_mask = (ref_date - df_clean[due_col]).dt.days > 0
+        cp_overdue_counts = df_clean.loc[overdue_mask, cp_col].value_counts().to_dict()
+
+    for idx, row in df_clean.iterrows():
+        row_index = idx + 1
+        flags = []
+        amt = float(row[amt_col]) if pd.notnull(row.get(amt_col)) else 0.0
+        cp = str(row.get(cp_col, "Unknown Counterparty"))
+        due = row.get(due_col)
+        inv = row.get(inv_col)
+        pay = row.get(pay_col)
+
+        # AGE-001: Severe Overdue
+        overdue_days = (ref_date - due).days if pd.notnull(due) else 0
+        if overdue_days > severe_overdue_days:
+            sev = "CRITICAL" if overdue_days > 300 or amt > 100000 else "HIGH"
+            flags.append({
+                "rule_code": "AGE-001",
+                "rule_name": "Severe Overdue Invoice",
+                "severity": sev,
+                "amount": amt,
+                "description": f"Invoice of {format_currency(amt)} for '{cp}' is {overdue_days} days overdue past benchmark date.",
+                "remediation": "Initiate formal legal notice and set up ECL doubtful account provisioning."
+            })
+
+        # AGE-002: Inverted Chronology
+        if pd.notnull(inv) and pd.notnull(pay) and pay < inv:
+            flags.append({
+                "rule_code": "AGE-002",
+                "rule_name": "Inverted Document Chronology",
+                "severity": "CRITICAL",
+                "amount": amt,
+                "description": f"Payment logged on {pay.strftime('%Y-%m-%d')} before invoice generation on {inv.strftime('%Y-%m-%d')}.",
+                "remediation": "Investigate potential ghost invoice or premature fund disbursement."
+            })
+
+        # AGE-003: Chronic Delinquency
+        if cp_overdue_counts.get(cp, 0) >= 2 and overdue_days > 0:
+            flags.append({
+                "rule_code": "AGE-003",
+                "rule_name": "Chronic Counterparty Delinquency",
+                "severity": "HIGH",
+                "amount": amt,
+                "description": f"Counterparty '{cp}' has {cp_overdue_counts[cp]} active delinquent records across ledger.",
+                "remediation": "Impose strict advance payment terms or suspend credit facility."
+            })
+
+        results.append({
+            "row_index": row_index,
+            "status": "FLAGGED" if len(flags) > 0 else "CLEARED",
+            "flags": flags
+        })
+
+    return results
+
+
+def audit_general_ledger(df: pd.DataFrame, col_map: dict = None, period_end_days: int = 4) -> list:
+    """
+    Audits General Ledger dataset for:
+    - GL-001: Unbalanced journal voucher (Debit != Credit)
+    - GL-002: Off-hours / Weekend manual posting
+    """
+    results = []
+    dr_col = col_map.get("debit", "debit") if col_map else "debit"
+    cr_col = col_map.get("credit", "credit") if col_map else "credit"
+    date_col = col_map.get("posting_date", "posting_date") if col_map else "posting_date"
+    vouch_col = col_map.get("voucher_id", "voucher_id") if col_map else "voucher_id"
+
+    df_clean = df.copy()
+    if date_col in df_clean.columns:
+        df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
+
+    voucher_balances = {}
+    if vouch_col in df_clean.columns:
+        grouped = df_clean.groupby(vouch_col)
+        for v_id, group in grouped:
+            total_dr = group[dr_col].sum() if dr_col in group.columns else 0.0
+            total_cr = group[cr_col].sum() if cr_col in group.columns else 0.0
+            voucher_balances[v_id] = (total_dr, total_cr)
+
+    for idx, row in df_clean.iterrows():
+        row_index = idx + 1
+        flags = []
+        dr = float(row[dr_col]) if dr_col in row and pd.notnull(row[dr_col]) else 0.0
+        cr = float(row[cr_col]) if cr_col in row and pd.notnull(row[cr_col]) else 0.0
+        v_id = str(row.get(vouch_col, f"VOUCH-{row_index}"))
+        p_date = row.get(date_col)
+
+        if v_id in voucher_balances:
+            tot_dr, tot_cr = voucher_balances[v_id]
+            diff = abs(tot_dr - tot_cr)
+            if diff > 0.01:
+                flags.append({
+                    "rule_code": "GL-001",
+                    "rule_name": "Unbalanced Journal Voucher",
+                    "severity": "CRITICAL",
+                    "amount": diff,
+                    "debit": tot_dr,
+                    "credit": tot_cr,
+                    "description": f"Voucher '{v_id}' is out of balance: Total Dr = {format_currency(tot_dr)}, Total Cr = {format_currency(tot_cr)} (Diff: {format_currency(diff)}).",
+                    "remediation": "Reconcile offsetting credit/debit leg before posting to master ledger."
                 })
 
-    return summary_stats, by_domain
+        if pd.notnull(p_date) and p_date.weekday() in [5, 6]:
+            day_name = p_date.strftime("%A")
+            date_str = p_date.strftime("%Y-%m-%d")
+            flags.append({
+                "rule_code": "GL-002",
+                "rule_name": "Weekend Manual Journal Entry",
+                "severity": "HIGH",
+                "amount": max(dr, cr),
+                "description": f"Manual journal adjustment posted on {day_name} ({date_str}) outside business authorization hours.",
+                "remediation": "Verify management sign-off and server authentication logs for emergency weekend entry."
+            })
+
+        results.append({
+            "row_index": row_index,
+            "status": "FLAGGED" if len(flags) > 0 else "CLEARED",
+            "flags": flags
+        })
+
+    return results
 
 
-# ---------------------------------------------------------------
-# Section 1 - pure Python
-# ---------------------------------------------------------------
-
-def _render_section_1(summary_stats: list) -> str:
-    total_files = len(summary_stats)
-    total_rows = sum(s["rows"] for s in summary_stats)
-    total_anomalies = sum(s["flagged_anomalies"] for s in summary_stats)
-
-    lines = [
-        "## 1. Executive Summary & Verified Exposure",
-        "",
-        f"- **Exact Files Processed:** {total_files}",
-        f"- **Exact Combined Row Count Across All Files:** {total_rows}",
-        f"- **Exact Total Flagged Anomalies:** {total_anomalies}",
-        "",
-        "| Domain | Exact Rows | Exact Flagged Anomalies |",
-        "|--------|------------|--------------------------|",
-    ]
-    for s in summary_stats:
-        display = DOMAIN_DISPLAY_NAMES.get(s["domain"], s["domain"])
-        lines.append(f"| {display} | {s['rows']} | {s['flagged_anomalies']} |")
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------
-# Section 2 - pure Python, no LLM call at all
-# ---------------------------------------------------------------
-
-def _escape_md(text: str) -> str:
-    """Escapes pipe characters so a value can't break a Markdown table row."""
-    return str(text).replace("|", "\\|")
-
-
-def _render_section_2_domain(domain: str, findings: list) -> str:
-    display_name = DOMAIN_DISPLAY_NAMES.get(domain, domain)
-
-    if not findings:
-        return f"### {display_name}\n\n_No flagged anomalies in this domain._\n"
-
-    lines = [
-        f"### {display_name}",
-        "",
-        "| Row | Rule | Severity | Finding | Detected Value | Remediation |",
-        "|-----|------|----------|---------|-----------------|-------------|",
-    ]
-    for f in findings:
-        lines.append(
-            f"| {f['row_index']} | {f['rule_code']} | {f['severity']} "
-            f"| {_escape_md(f['description'])} | {_escape_md(f['detected_value'])} "
-            f"| {_escape_md(f['remediation'])} |"
-        )
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _render_section_2(by_domain: dict) -> str:
-    parts = ["## 2. Multi-Domain Anomaly Register", ""]
-
-    for domain in DOMAIN_DISPLAY_NAMES:
-        if domain not in by_domain:
-            continue
-        parts.append(_render_section_2_domain(domain, by_domain[domain]))
-
-    for domain, findings in by_domain.items():
-        if domain not in DOMAIN_DISPLAY_NAMES:
-            parts.append(_render_section_2_domain(domain, findings))
-
-    return "\n".join(parts)
-
-
-# ---------------------------------------------------------------
-# Section 3 - the ONLY LLM call. Narrative only, no numbers, no
-# rule-code fabrication allowed.
-# ---------------------------------------------------------------
-
-def _render_section_3(client, by_domain: dict, max_retries: int = 2) -> tuple:
-    domains_present = [DOMAIN_DISPLAY_NAMES.get(d, d) for d in by_domain if by_domain[d]]
-    if not domains_present:
-        return "## 3. Recommended Substantive Audit Procedures\n\n_No flagged anomalies requiring follow-up._\n", []
-
-    prompt = f"""Write "## 3. Recommended Substantive Audit Procedures" as a numbered action plan for a forensic audit dossier.
-
-Cover only these domains, which had flagged anomalies: {', '.join(domains_present)}.
-
-Strict rules:
-- Do NOT mention any currency amount or numeric threshold anywhere.
-- Do NOT reference any rule code (e.g. "TXN-001") - discuss domains and general control weaknesses only, not specific rule identifiers.
-- Do NOT invent new categories of risk beyond what a normal audit review of these domains would cover.
-- Keep it concise: 1-2 sentences per domain.
-"""
-
-    warnings = []
-    text = ""
-    attempt = 0
-
-    while attempt <= max_retries:
-        text = _call_groq_with_backoff(client, [{"role": "user", "content": prompt}], temperature=0.1)
-        issues = _check_hallucinations(text)
-        if not issues:
-            return text, []
-        attempt += 1
-
-    issues = _check_hallucinations(text)
-    if issues:
-        warnings.append(f"Section 3 integrity check failed after retries: {issues}")
-    return text, warnings
-
-
-# ---------------------------------------------------------------
-# Public entry point - same signature as before, app.py unchanged
-# ---------------------------------------------------------------
-
-def generate_consolidated_master_report(all_domain_data: dict, max_retries: int = 1):
+def audit_fixed_assets(df: pd.DataFrame, col_map: dict = None, as_of_date: str = None) -> list:
     """
-    Synthesizes the unified Master Report.
-    Returns (report_text, sentry_warnings) - identical shape to before,
-    so app.py requires NO changes.
+    Audits Fixed Assets dataset for:
+    - AST-001: Undefined depreciation method
+    - AST-002: Book value exceeds historical acquisition cost
+    - AST-003: Depreciation curve / WDV deviation anomaly
     """
-    client = get_groq_client()
-    summary_stats, by_domain = _build_domain_payload(all_domain_data)
-
-    section_1 = _render_section_1(summary_stats)
-    section_2 = _render_section_2(by_domain)  # pure Python, no warnings possible
-    section_3, warnings_3 = _render_section_3(client, by_domain, max_retries)
-
-    report_text = (
-        "# FORENSIC AUDIT EXECUTIVE DOSSIER\n\n"
-        + section_1 + "\n---\n\n"
-        + section_2 + "\n---\n\n"
-        + section_3
-    )
-
-    return report_text, warnings_3
-
-
-# ---------------------------------------------------------------
-# Other memo functions - Fixed with Hallucination Guards & Backoff
-# ---------------------------------------------------------------
-
-def generate_executive_memo(domain_name: str, findings: list):
-    """Generates domain-level executive summary memo."""
-    client = get_groq_client()
-    prompt = f"Provide a executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
+    results = []
+    cost_col = col_map.get("cost", "cost") if col_map else "cost"
+    bv_col = col_map.get("book_value", "book_value") if col_map else "book_value"
+    method_col = col_map.get("method", "method") if col_map else "method"
+    asset_col = col_map.get("asset_name", "asset_name") if col_map else "asset_name"
+    date_col = col_map.get("purchase_date", "purchase_date") if col_map else "purchase_date"
+    life_col = col_map.get("useful_life", "useful_life") if col_map else "useful_life"
     
-    return _call_groq_with_backoff(
-        client, 
-        [{"role": "user", "content": prompt}], 
-        temperature=0.2
-    )
-
-
-def generate_5c_finding_memo(record_data: dict, domain_name: str, max_retries: int = 2):
-    """Generates 5C audit memo (Condition, Criteria, Cause, Effect, Recommendation)."""
-    client = get_groq_client()
-    prompt = f"""Generate a 5C audit note for row #{record_data['row_index']} in {domain_name}. Data: {json.dumps(record_data)}
-    
-Strict rules:
-- Do NOT mention any currency amount or numeric threshold anywhere. (Rely on the UI data table to present the numbers).
-- Do NOT invent or reference any rule code that is not explicitly provided in the Data context.
-"""
-    attempt = 0
-    while attempt <= max_retries:
-        text = _call_groq_with_backoff(
-            client, 
-            [{"role": "user", "content": prompt}], 
-            temperature=0.2
-        )
-        issues = _check_hallucinations(text)
-        if not issues:
-            return text
-        attempt += 1
+    df_clean = df.copy()
+    if date_col in df_clean.columns:
+        df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
         
-    return text + "\n\n*(Note: Sentry system could not fully verify strict numeric/code omission for this memo.)*"
+    ref_date = pd.to_datetime(as_of_date) if as_of_date else pd.to_datetime(datetime.today())
+
+    for idx, row in df_clean.iterrows():
+        row_index = idx + 1
+        flags = []
+        cost = float(row[cost_col]) if cost_col in row and pd.notnull(row[cost_col]) else 0.0
+        bv = float(row[bv_col]) if bv_col in row and pd.notnull(row[bv_col]) else 0.0
+        method = str(row.get(method_col, "")).strip()
+        asset_name = str(row.get(asset_col, f"Asset #{row_index}"))
+        p_date = row.get(date_col)
+        life = float(row[life_col]) if life_col in row and pd.notnull(row[life_col]) else 0.0
+
+        # AST-001: Undefined depreciation
+        if not method or method.lower() in ["nan", "none", "null", "''", ""]:
+            flags.append({
+                "rule_code": "AST-001",
+                "rule_name": "Undefined Depreciation Policy",
+                "severity": "HIGH",
+                "amount": cost,
+                "description": f"Asset '{asset_name}' has no recognized depreciation amortization schedule.",
+                "remediation": "Assign depreciation schedule matching corporate asset capitalization policy."
+            })
+
+        # AST-002: BV > Cost
+        if bv > cost:
+            flags.append({
+                "rule_code": "AST-002",
+                "rule_name": "Carrying Value Exceeds Cost",
+                "severity": "CRITICAL",
+                "amount": bv - cost,
+                "book_value": bv,
+                "cost": cost,
+                "description": f"Carrying value of {format_currency(bv)} exceeds historical acquisition cost of {format_currency(cost)}.",
+                "remediation": "Inspect asset ledger for unauthorized write-ups or misallocated additions."
+            })
+
+        # AST-003: Depreciation Curve Deviation
+        if pd.notnull(p_date) and cost > 0 and life > 0:
+            age_years = (ref_date - p_date).days / 365.25
+            if age_years >= 1.0:
+                expected_bv = max(0.0, cost - (cost / life * age_years))
+                if (bv - expected_bv) > (cost * 0.15):
+                    flags.append({
+                        "rule_code": "AST-003",
+                        "rule_name": "Depreciation Curve Anomaly",
+                        "severity": "HIGH",
+                        "amount": bv - expected_bv,
+                        "description": f"Asset '{asset_name}' book value ({format_currency(bv)}) is highly inflated vs. expected straight-line depreciation ({format_currency(expected_bv)}).",
+                        "remediation": "Verify accumulated depreciation ledger and ensure consistent write-down procedures."
+                    })
+
+        results.append({
+            "row_index": row_index,
+            "status": "FLAGGED" if len(flags) > 0 else "CLEARED",
+            "flags": flags
+        })
+
+    return results
