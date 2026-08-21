@@ -21,6 +21,8 @@ stray "GT token" columns) by construction, not by instruction.
 import os
 import re
 import json
+import time
+import random
 from groq import Groq
 
 MODEL_NAME = "llama-3.3-70b-versatile"
@@ -30,10 +32,10 @@ MODEL_NAME = "llama-3.3-70b-versatile"
 # code here too, or the Section 3 whitelist check will reject mentions
 # of it (which is a safe failure direction, but worth keeping current).
 KNOWN_RULE_CODES = {
-    "TXN-001", "TXN-002", "TXN-004",
-    "AGE-001", "AGE-003",
+    "TXN-001", "TXN-002", "TXN-003", "TXN-004",  # Added missing TXN-003 back to whitelist
+    "AGE-001", "AGE-002", "AGE-003",             # Added missing AGE-002 back to whitelist
     "GL-001", "GL-002",
-    "AST-001", "AST-002",
+    "AST-001", "AST-002", "AST-003",             # Added missing AST-003 back to whitelist
 }
 
 DOMAIN_DISPLAY_NAMES = {
@@ -55,6 +57,59 @@ def get_groq_client():
 def format_currency(val: float) -> str:
     """Guarantees strict two-decimal currency formatting."""
     return f"₹{float(val):,.2f}"
+
+
+# ---------------------------------------------------------------
+# Core API Caller with Exponential Backoff (429 Rate Limit Guard)
+# ---------------------------------------------------------------
+
+def _call_groq_with_backoff(client, messages: list, max_retries: int = 4, temperature: float = 0.1):
+    """
+    Executes a Groq chat completion with exponential backoff and jitter.
+    Vital for free-tier usage where 429 Rate Limit errors are common.
+    """
+    base_delay = 1.0
+    
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                max_tokens=1024,
+                temperature=temperature
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            err_msg = str(e).lower()
+            if ("429" in err_msg or "rate limit" in err_msg) and attempt < max_retries:
+                # Exponential backoff: 1s, 2s, 4s, 8s + random jitter to prevent thundering herd
+                sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0.1, 1.0)
+                time.sleep(sleep_time)
+            else:
+                # Either out of retries or it's a non-429 error (e.g., auth failure)
+                raise
+
+
+# ---------------------------------------------------------------
+# Shared Hallucination Guards
+# ---------------------------------------------------------------
+
+def _check_hallucinations(text: str) -> list:
+    """
+    Ensures generative text does not contain currency figures or invented rule codes.
+    Returns a list of problems found (empty = clean).
+    """
+    problems = []
+
+    if re.search(r'₹\d', text):
+        problems.append("Text contains a currency figure, which is not allowed.")
+
+    mentioned_codes = set(re.findall(r'\b[A-Z]{2,4}-\d{3}\b', text))
+    invented = mentioned_codes - KNOWN_RULE_CODES
+    if invented:
+        problems.append(f"Text references unknown rule code(s): {sorted(invented)}")
+
+    return problems
 
 
 # ---------------------------------------------------------------
@@ -204,25 +259,7 @@ def _render_section_2(by_domain: dict) -> str:
 # rule-code fabrication allowed.
 # ---------------------------------------------------------------
 
-def _check_section_3(text: str) -> list:
-    """
-    Section 3 must not contain currency figures or invented rule codes.
-    Returns a list of problems found (empty = clean).
-    """
-    problems = []
-
-    if re.search(r'₹\d', text):
-        problems.append("Section 3 contains a currency figure, which is not allowed.")
-
-    mentioned_codes = set(re.findall(r'\b[A-Z]{2,4}-\d{3}\b', text))
-    invented = mentioned_codes - KNOWN_RULE_CODES
-    if invented:
-        problems.append(f"Section 3 references unknown rule code(s): {sorted(invented)}")
-
-    return problems
-
-
-def _render_section_3(client, by_domain: dict, max_retries: int = 1) -> tuple:
+def _render_section_3(client, by_domain: dict, max_retries: int = 2) -> tuple:
     domains_present = [DOMAIN_DISPLAY_NAMES.get(d, d) for d in by_domain if by_domain[d]]
     if not domains_present:
         return "## 3. Recommended Substantive Audit Procedures\n\n_No flagged anomalies requiring follow-up._\n", []
@@ -243,19 +280,13 @@ Strict rules:
     attempt = 0
 
     while attempt <= max_retries:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.1
-        )
-        text = response.choices[0].message.content
-        issues = _check_section_3(text)
+        text = _call_groq_with_backoff(client, [{"role": "user", "content": prompt}], temperature=0.1)
+        issues = _check_hallucinations(text)
         if not issues:
             return text, []
         attempt += 1
 
-    issues = _check_section_3(text)
+    issues = _check_hallucinations(text)
     if issues:
         warnings.append(f"Section 3 integrity check failed after retries: {issues}")
     return text, warnings
@@ -289,30 +320,40 @@ def generate_consolidated_master_report(all_domain_data: dict, max_retries: int 
 
 
 # ---------------------------------------------------------------
-# Other memo functions - unchanged
+# Other memo functions - Fixed with Hallucination Guards & Backoff
 # ---------------------------------------------------------------
 
 def generate_executive_memo(domain_name: str, findings: list):
     """Generates domain-level executive summary memo."""
     client = get_groq_client()
     prompt = f"Provide a executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
+    
+    return _call_groq_with_backoff(
+        client, 
+        [{"role": "user", "content": prompt}], 
         temperature=0.2
     )
-    return response.choices[0].message.content
 
 
-def generate_5c_finding_memo(record_data: dict, domain_name: str):
+def generate_5c_finding_memo(record_data: dict, domain_name: str, max_retries: int = 2):
     """Generates 5C audit memo (Condition, Criteria, Cause, Effect, Recommendation)."""
     client = get_groq_client()
-    prompt = f"Generate a 5C audit note for row #{record_data['row_index']} in {domain_name}. Data: {json.dumps(record_data)}"
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
-        temperature=0.2
-    )
-    return response.choices[0].message.content
+    prompt = f"""Generate a 5C audit note for row #{record_data['row_index']} in {domain_name}. Data: {json.dumps(record_data)}
+    
+Strict rules:
+- Do NOT mention any currency amount or numeric threshold anywhere. (Rely on the UI data table to present the numbers).
+- Do NOT invent or reference any rule code that is not explicitly provided in the Data context.
+"""
+    attempt = 0
+    while attempt <= max_retries:
+        text = _call_groq_with_backoff(
+            client, 
+            [{"role": "user", "content": prompt}], 
+            temperature=0.2
+        )
+        issues = _check_hallucinations(text)
+        if not issues:
+            return text
+        attempt += 1
+        
+    return text + "\n\n*(Note: Sentry system could not fully verify strict numeric/code omission for this memo.)*"
