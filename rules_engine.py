@@ -25,7 +25,9 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
     vendor_col = col_map.get("vendor", "vendor") if col_map else "vendor"
     appr_col = col_map.get("approved_by", "approved_by") if col_map else "approved_by"
 
-    df_clean = df.copy()
+    # Use a unique positional index for internal calculations so uploaded files
+    # with duplicate labels cannot break rolling-window assignment.
+    df_clean = df.copy().reset_index(drop=True)
     if date_col in df_clean.columns:
         df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
 

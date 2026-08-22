@@ -9,6 +9,11 @@ import time
 import random
 from groq import Groq
 
+try:
+    import streamlit as st
+except ImportError:  # Allows the helper module to run outside Streamlit.
+    st = None
+
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 KNOWN_RULE_CODES = {
@@ -25,11 +30,42 @@ DOMAIN_DISPLAY_NAMES = {
     "fixed_assets": "Fixed Assets",
 }
 
+def _get_groq_api_keys() -> list[str]:
+    """Load up to four Groq keys from Streamlit secrets or environment variables."""
+    secret_names = [f"GROQ_API_KEY_{index}" for index in range(1, 5)]
+    keys = []
+
+    for name in secret_names:
+        value = os.environ.get(name)
+        if not value and st is not None:
+            try:
+                value = st.secrets.get(name)
+            except (FileNotFoundError, RuntimeError):
+                value = None
+        if value and str(value).strip():
+            keys.append(str(value).strip())
+
+    # Keep the conventional single-key name as a backwards-compatible fallback.
+    fallback = os.environ.get("GROQ_API_KEY")
+    if not fallback and st is not None:
+        try:
+            fallback = st.secrets.get("GROQ_API_KEY")
+        except (FileNotFoundError, RuntimeError):
+            fallback = None
+    if not keys and fallback and str(fallback).strip():
+        keys.append(str(fallback).strip())
+
+    return list(dict.fromkeys(keys))
+
+
 def get_groq_client():
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY environment variable is missing.")
-    return Groq(api_key=api_key)
+    api_keys = _get_groq_api_keys()
+    if not api_keys:
+        raise ValueError(
+            "No Groq API key was found. Add GROQ_API_KEY_1 through "
+            "GROQ_API_KEY_4 to Streamlit secrets."
+        )
+    return Groq(api_key=random.choice(api_keys))
 
 def format_currency(val: float) -> str:
     return f"₹{float(val):,.2f}"
