@@ -90,6 +90,7 @@ if "custom_col_map" not in st.session_state: st.session_state["custom_col_map"] 
 if "individual_memos" not in st.session_state: st.session_state["individual_memos"] = {}
 if "multi_file_data" not in st.session_state: st.session_state["multi_file_data"] = {}
 if "active_file_name" not in st.session_state: st.session_state["active_file_name"] = None
+if "audit_config" not in st.session_state: st.session_state["audit_config"] = None
 
 # ---------------------------------------------------------
 # Sidebar
@@ -121,10 +122,14 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     new_names = {f.name for f in uploaded_files}
     old_names = set(st.session_state["multi_file_data"].keys())
-    
-    if new_names != old_names:
+    current_audit_config = (tuple(sorted(new_names)), as_of_date.isoformat(), txn_threshold)
+
+    # Re-run every date-sensitive rule when the benchmark changes, even when
+    # the user uploads files with the same names as the previous run.
+    if new_names != old_names or current_audit_config != st.session_state["audit_config"]:
         st.session_state["multi_file_data"] = {}
         for file in uploaded_files:
+            file.seek(0)
             df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
             classification = classify_columns(list(df.columns))
             
@@ -147,9 +152,11 @@ if uploaded_files:
                 "df": df,
                 "category": category,
                 "findings": findings,
-                "classification": classification
+                "classification": classification,
+                "audit_as_of_date": as_of_date.isoformat(),
             }
-        
+
+        st.session_state["audit_config"] = current_audit_config
         st.session_state["active_file_name"] = uploaded_files[0].name
         st.session_state["working_df"] = st.session_state["multi_file_data"][uploaded_files[0].name]["df"]
         st.session_state["override_category"] = None
@@ -164,12 +171,20 @@ if st.session_state["multi_file_data"]:
     st.markdown("### 🌐 Consolidated Multi-Domain Dashboard")
     
     total_files = len(st.session_state["multi_file_data"])
-    total_anomalies = sum(len([f for f in data["findings"] if f["status"] == "FLAGGED"]) for data in st.session_state["multi_file_data"].values())
-    
-    c1, c2, c3 = st.columns(3)
+    total_flagged_rows = sum(
+        sum(1 for item in data["findings"] if item["status"] == "FLAGGED")
+        for data in st.session_state["multi_file_data"].values()
+    )
+    total_findings = sum(
+        sum(len(item.get("flags", [])) for item in data["findings"])
+        for data in st.session_state["multi_file_data"].values()
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Domains Analyzed", total_files)
     c2.metric("Total Rows Processed", sum(len(data["df"]) for data in st.session_state["multi_file_data"].values()))
-    c3.metric("Total Flagged Anomalies", total_anomalies)
+    c3.metric("Flagged Rows", total_flagged_rows)
+    c4.metric("Individual Findings", total_findings)
 
     if st.button("✨ Generate Unified Master Report", type="primary", use_container_width=True):
         with st.spinner("Calculating exact metrics and synthesizing dossier..."):

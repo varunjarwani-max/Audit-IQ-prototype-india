@@ -1,6 +1,7 @@
 import pandas as pd
 
 from detector import classify_columns
+from groq_advisor import generate_consolidated_master_report
 from rules_engine import audit_aging, audit_fixed_assets, audit_transactions
 
 
@@ -104,3 +105,31 @@ def test_duplicate_dates_and_indices_are_supported():
     findings = audit_transactions(df)
     assert len(findings) == 2
     assert "TXN-004" in rule_codes(findings[1])
+
+
+def test_master_report_counts_findings_and_discloses_methodology():
+    data = {
+        "aging.csv": {
+            "category": "ar_ap_aging",
+            "df": pd.DataFrame([{"amount": 1000}]),
+            "audit_as_of_date": "2026-08-22",
+            "findings": [{
+                "row_index": 1,
+                "status": "FLAGGED",
+                "flags": [
+                    {"rule_code": "AGE-001", "severity": "HIGH", "amount": 1000, "description": "Open overdue invoice.", "remediation": "Review."},
+                    {"rule_code": "AGE-003", "severity": "HIGH", "amount": 1000, "description": "Repeated delinquency.", "remediation": "Review."},
+                ],
+            }],
+        }
+    }
+
+    report, warnings = generate_consolidated_master_report(data)
+
+    assert not warnings
+    assert "**Flagged Rows:** 1" in report
+    assert "**Individual Rule Findings:** 2" in report
+    assert "**Audit As-Of / Benchmark Date:** 2026-08-22" in report
+    assert "| Accounts Receivable / Accounts Payable Aging | 1 | 1 | 2 |" in report
+    assert "## 4. Report Completion Statement" in report
+    assert report.rstrip().endswith("used for this run.")

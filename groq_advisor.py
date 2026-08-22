@@ -131,12 +131,15 @@ def _build_domain_payload(all_domain_data: dict):
         df = file_info.get("df")
         findings = file_info.get("findings", [])
 
-        flagged_count = sum(1 for f in findings if f.get("status") == "FLAGGED")
+        flagged_row_count = sum(1 for f in findings if f.get("status") == "FLAGGED")
+        finding_count = sum(len(f.get("flags", [])) for f in findings)
         summary_stats.append({
             "file": file_name,
             "domain": domain,
             "rows": len(df) if df is not None else 0,
-            "flagged_anomalies": flagged_count
+            "flagged_rows": flagged_row_count,
+            "findings": finding_count,
+            "audit_as_of_date": file_info.get("audit_as_of_date"),
         })
 
         by_domain.setdefault(domain, [])
@@ -176,21 +179,29 @@ def _build_domain_payload(all_domain_data: dict):
 def _render_section_1(summary_stats: list) -> str:
     total_files = len(summary_stats)
     total_rows = sum(s["rows"] for s in summary_stats)
-    total_anomalies = sum(s["flagged_anomalies"] for s in summary_stats)
+    total_flagged_rows = sum(s["flagged_rows"] for s in summary_stats)
+    total_findings = sum(s["findings"] for s in summary_stats)
+    audit_dates = sorted({s["audit_as_of_date"] for s in summary_stats if s.get("audit_as_of_date")})
+    benchmark = ", ".join(audit_dates) if audit_dates else "Not supplied"
 
     lines = [
         "## 1. Executive Summary & Verified Exposure",
         "",
         f"- **Exact Files Processed:** {total_files}",
         f"- **Exact Combined Row Count Across All Files:** {total_rows}",
-        f"- **Exact Total Flagged Anomalies:** {total_anomalies}",
+        f"- **Flagged Rows:** {total_flagged_rows}",
+        f"- **Individual Rule Findings:** {total_findings}",
+        f"- **Audit As-Of / Benchmark Date:** {benchmark}",
+        "- **Counting Basis:** A flagged row is counted once; individual findings count every rule triggered on that row.",
+        "- **Aging Method:** AGE-001 applies only to open/unpaid invoices more than 90 days past due. AGE-003 counts only open, past-due invoices by counterparty.",
+        "- **Depreciation Method:** AST-003 uses the uploaded recognized method, a 365.25-day year, and flags positive book-value variance above 15% of cost after at least one year.",
         "",
-        "| Domain | Exact Rows | Exact Flagged Anomalies |",
-        "|--------|------------|--------------------------|"
+        "| Domain | Rows | Flagged Rows | Individual Findings |",
+        "|--------|------|--------------|---------------------|"
     ]
     for s in summary_stats:
         display = DOMAIN_DISPLAY_NAMES.get(s["domain"], s["domain"])
-        lines.append(f"| {display} | {s['rows']} | {s['flagged_anomalies']} |")
+        lines.append(f"| {display} | {s['rows']} | {s['flagged_rows']} | {s['findings']} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -226,43 +237,32 @@ def _render_section_2(by_domain: dict) -> str:
             parts.append(_render_section_2_domain(domain, findings))
     return "\n".join(parts)
 
-def _render_section_3(client, by_domain: dict, max_retries: int = 2) -> tuple:
-    domains_present = [DOMAIN_DISPLAY_NAMES.get(d, d) for d in by_domain if by_domain[d]]
-    if not domains_present:
+def _render_section_3(by_domain: dict) -> tuple:
+    """Render complete procedures deterministically so exports cannot truncate."""
+    procedures = {
+        "transactions": "Inspect approval evidence, vendor support, purchase orders, and related disbursements for authorization and possible invoice splitting.",
+        "ar_ap_aging": "Confirm open balances directly with counterparties, inspect subsequent receipts or payments, reconcile status fields, and evaluate collection and expected-credit-loss actions.",
+        "general_ledger": "Reperform voucher balancing, inspect support and approval for manual or weekend postings, and resolve reused or non-unique journal references.",
+        "fixed_assets": "Inspect capitalization support, verify assigned depreciation methods and useful lives, recalculate depreciation through the disclosed audit date, and review additions and disposals for authorization.",
+    }
+    active_domains = [domain for domain, findings in by_domain.items() if findings]
+    if not active_domains:
         return "## 3. Recommended Substantive Audit Procedures\n\n_No flagged anomalies requiring follow-up._\n", []
 
-    prompt = f"""Write "## 3. Recommended Substantive Audit Procedures" as a numbered action plan for a forensic audit dossier.
-Cover only these domains, which had flagged anomalies: {', '.join(domains_present)}.
-Strict rules:
-- Do NOT mention any currency amount or numeric threshold anywhere.
-- Do NOT reference any rule code (e.g. "TXN-001") - discuss domains and general control weaknesses only, not specific rule identifiers.
-- Do NOT invent new categories of risk beyond what a normal audit review of these domains would cover.
-- Keep it concise: 1-2 sentences per domain."""
-
-    warnings = []
-    text = ""
-    attempt = 0
-    while attempt <= max_retries:
-        text = _call_with_emergency_fallback(
-            client, [{"role": "user", "content": prompt}], model=CHECKER_MODEL, temperature=0.1
-        )
-        issues = _check_hallucinations(text)
-        if not issues:
-            return text, []
-        attempt += 1
-
-    issues = _check_hallucinations(text)
-    if issues:
-        warnings.append(f"Section 3 integrity check failed after retries: {issues}")
-    return text, warnings
+    lines = ["## 3. Recommended Substantive Audit Procedures", ""]
+    for number, domain in enumerate(active_domains, start=1):
+        display = DOMAIN_DISPLAY_NAMES.get(domain, domain)
+        procedure = procedures.get(domain, "Inspect source records, approvals, reconciliations, and subsequent events supporting the identified exceptions.")
+        lines.append(f"{number}. **{display}:** {procedure}")
+    lines.extend(["", "## 4. Report Completion Statement", "", "This dossier includes every uploaded domain, all deterministic rule findings, the counting basis, and the benchmark methodology used for this run."])
+    return "\n".join(lines), []
 
 def generate_consolidated_master_report(all_domain_data: dict, max_retries: int = 1):
-    client = get_groq_client()
     summary_stats, by_domain = _build_domain_payload(all_domain_data)
 
     section_1 = _render_section_1(summary_stats)
     section_2 = _render_section_2(by_domain)
-    section_3, warnings_3 = _render_section_3(client, by_domain, max_retries)
+    section_3, warnings_3 = _render_section_3(by_domain)
 
     report_text = (
         "# FORENSIC AUDIT EXECUTIVE DOSSIER\n\n"
