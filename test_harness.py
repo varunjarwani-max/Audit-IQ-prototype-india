@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 from detector import classify_columns, ALIAS_DEFINITIONS
 from rules_engine import audit_transactions, audit_aging, audit_general_ledger, audit_fixed_assets
-from groq_advisor import generate_5c_finding_memo, test_groq_key, SUPPORTED_MODELS
+from groq_advisor import DRAFTER_MODEL, generate_5c_finding_memo
 from sample_data import SAMPLE_DATASETS
 
 
@@ -87,7 +87,6 @@ def run_benchmark(
     forced_category: str = None, 
     llm_samples: int = 2,
     api_key: str = None,
-    model: str = "openai/gpt-oss-20b",
     as_of_date: str = None
 ):
     print("=" * 80)
@@ -163,12 +162,19 @@ def run_benchmark(
         print(f"    ✅ Cross-row rule TXN-004 successfully captured {rule_counts['TXN-004']} structured split payments across full dataset context.")
 
     # 4. Benchmark Individual 5C LLM Workpaper Generation (generate_5c_finding_memo)
-    groq_key = api_key or os.getenv("GROQ_API_KEY")
-    if not groq_key:
-        print("\n[!] Skipping LLM 5C workpaper benchmark (no GROQ_API_KEY provided).")
-        print("    To run LLM tests: python test_harness.py --api-key gsk_...")
+    groq_key = api_key or next(
+        (os.getenv(name) for name in ["GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_4", "GROQ_API_KEY"] if os.getenv(name)),
+        None,
+    )
+    if llm_samples <= 0:
+        print("\n[4] Skipping LLM benchmark because --llm-samples is 0.")
+    elif not groq_key:
+        print("\n[!] Skipping LLM 5C workpaper benchmark (no Groq key is available to this process).")
+        print("    Streamlit Cloud secrets remain isolated from local command-line tests.")
     else:
-        print(f"\n[4] Benchmarking Per-Record 5C Workpaper Generation with Groq ({model})...")
+        if api_key:
+            os.environ["GROQ_API_KEY"] = api_key
+        print(f"\n[4] Benchmarking Per-Record 5C Workpaper Generation with Groq ({DRAFTER_MODEL})...")
         print(f"    Pacing at ~2.0s interval to respect free-tier ~30 RPM rate-limiting ceiling...")
         
         sample_subset = flagged_records[:llm_samples]
@@ -186,10 +192,8 @@ def run_benchmark(
             t_call_start = time.perf_counter()
             try:
                 memo = generate_5c_finding_memo(
-                    api_key=groq_key,
-                    model=model,
-                    record=record_payload,
-                    category=ALIAS_DEFINITIONS[cat]["display_name"]
+                    record_data=record_payload,
+                    domain_name=ALIAS_DEFINITIONS[cat]["display_name"],
                 )
                 t_call_sec = time.perf_counter() - t_call_start
                 llm_times.append(t_call_sec)
@@ -221,7 +225,6 @@ if __name__ == "__main__":
     parser.add_argument("--as-of-date", "-d", type=str, default=None, help="Benchmark reference date for AR/AP aging & fixed assets (e.g. 2024-10-31)")
     parser.add_argument("--llm-samples", type=int, default=2, help="Number of flagged records to draft 5C memos for")
     parser.add_argument("--api-key", type=str, default=None, help="Groq API Key")
-    parser.add_argument("--model", type=str, default="openai/gpt-oss-20b", help="Model name")
 
     args = parser.parse_args()
     run_benchmark(
@@ -229,6 +232,5 @@ if __name__ == "__main__":
         forced_category=args.category,
         llm_samples=args.llm_samples,
         api_key=args.api_key,
-        model=args.model,
         as_of_date=args.as_of_date
     )

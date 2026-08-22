@@ -107,6 +107,18 @@ def test_duplicate_dates_and_indices_are_supported():
     assert "TXN-004" in rule_codes(findings[1])
 
 
+def test_split_invoicing_emits_only_when_window_first_crosses_threshold():
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=6, freq="D"),
+        "amount": [12000, 13000, 14000, 15000, 16000, 17000],
+        "vendor": ["Vendor A"] * 6,
+        "approved_by": ["Manager"] * 6,
+    })
+    findings = audit_transactions(df, threshold_limit=50000)
+    split_rows = [item["row_index"] for item in findings if "TXN-004" in rule_codes(item)]
+    assert split_rows == [4]
+
+
 def test_transaction_findings_use_source_values_and_extended_controls():
     df = pd.DataFrame([
         {"date": "2026-01-01", "amount": 12000, "vendor": "Normal", "approved_by": "R.Mehta", "currency": "INR", "three_way_match_status": "MATCHED", "duplicate_payment_candidate": "NO"},
@@ -138,6 +150,29 @@ def test_gl_controls_respect_export_structure_and_manual_marker():
     assert not rule_codes(findings[1])
     assert rule_codes(findings[2]) == {"GL-003"}
     assert {"GL-001", "GL-002"}.issubset(rule_codes(findings[3]))
+
+
+def test_gl002_requires_explicit_manual_evidence_for_every_supported_marker():
+    non_manual_markers = ["NO", "No", "false", "0", "system", "automatic", "", None]
+    manual_markers = ["YES", "yes", "true", "1", "manual", "Y"]
+    rows = [
+        {"posting_date": "2025-06-07", "debit": 1000, "credit": 0, "journal_reference": f"AUTO-{index}", "is_manual": marker}
+        for index, marker in enumerate(non_manual_markers)
+    ] + [
+        {"posting_date": "2025-06-07", "debit": 1000, "credit": 0, "journal_reference": f"MAN-{index}", "is_manual": marker}
+        for index, marker in enumerate(manual_markers)
+    ]
+    df = pd.DataFrame(rows)
+    mapping = classify_columns(list(df.columns))["matched_columns"]
+    findings = audit_general_ledger(df, mapping)
+
+    for item in findings[:len(non_manual_markers)]:
+        assert "GL-002" not in rule_codes(item)
+        assert all("manual" not in flag["description"].lower() for flag in item["flags"])
+    for item in findings[len(non_manual_markers):]:
+        assert "GL-002" in rule_codes(item)
+        gl002 = next(flag for flag in item["flags"] if flag["rule_code"] == "GL-002")
+        assert "marked manual" in gl002["description"].lower()
 
 
 def test_chronic_paid_lateness_and_asset_variance_are_visible():

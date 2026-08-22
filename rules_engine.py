@@ -143,7 +143,15 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
         rolling_count = row.get('rolling_count', 0)
         rolling_sum = row.get('rolling_sum', 0.0)
         
-        if rolling_count > 1 and rolling_sum >= threshold_limit:
+        # Emit once when a sequence of individually sub-threshold payments first
+        # crosses the approval limit. This avoids relabeling every later payment
+        # in an otherwise ordinary high-volume vendor window as structuring.
+        prior_window_sum = rolling_sum - max(amt, 0.0)
+        if (
+            0 < amt < threshold_limit
+            and rolling_count > 1
+            and prior_window_sum < threshold_limit <= rolling_sum
+        ):
             flags.append({
                 "rule_code": "TXN-004",
                 "rule_name": "7-Day Split Invoicing Breach",
