@@ -2,7 +2,7 @@ import pandas as pd
 
 from detector import classify_columns
 from groq_advisor import generate_consolidated_master_report
-from rules_engine import audit_aging, audit_fixed_assets, audit_transactions
+from rules_engine import audit_aging, audit_fixed_assets, audit_general_ledger, audit_transactions
 
 
 def rule_codes(result):
@@ -105,6 +105,55 @@ def test_duplicate_dates_and_indices_are_supported():
     findings = audit_transactions(df)
     assert len(findings) == 2
     assert "TXN-004" in rule_codes(findings[1])
+
+
+def test_transaction_findings_use_source_values_and_extended_controls():
+    df = pd.DataFrame([
+        {"date": "2026-01-01", "amount": 12000, "vendor": "Normal", "approved_by": "R.Mehta", "currency": "INR", "three_way_match_status": "MATCHED", "duplicate_payment_candidate": "NO"},
+        {"date": "2026-01-02", "amount": 75000, "vendor": "Missing", "approved_by": "", "currency": "INR", "three_way_match_status": "MATCHED", "duplicate_payment_candidate": "NO"},
+        {"date": "2026-01-03", "amount": 18000, "vendor": "Mismatch", "approved_by": "A", "currency": "", "three_way_match_status": "PRICE_MISMATCH", "duplicate_payment_candidate": "YES"},
+        {"date": "2026-01-04", "amount": -50000, "vendor": "Credit", "approved_by": "A", "currency": "INR", "three_way_match_status": "MATCHED", "duplicate_payment_candidate": "NO"},
+    ])
+    mapping = classify_columns(list(df.columns))["matched_columns"]
+    findings = audit_transactions(df, mapping)
+
+    assert "TXN-001" not in rule_codes(findings[0])
+    assert "TXN-001" in rule_codes(findings[1])
+    assert findings[1]["flags"][0]["amount"] == 75000
+    assert {"TXN-005", "TXN-006", "TXN-008"}.issubset(rule_codes(findings[2]))
+    assert "TXN-007" in rule_codes(findings[3])
+
+
+def test_gl_controls_respect_export_structure_and_manual_marker():
+    df = pd.DataFrame([
+        {"posting_date": "2025-04-05", "debit": 13750, "credit": 0, "journal_reference": "JE-0001", "is_manual": "NO"},
+        {"posting_date": "2025-04-06", "debit": 0, "credit": 9000, "journal_reference": "JE-0002", "is_manual": "NO"},
+        {"posting_date": "2025-06-07", "debit": 12000, "credit": 0, "journal_reference": "", "is_manual": "NO"},
+        {"posting_date": "2025-06-07", "debit": 10000, "credit": 9000, "journal_reference": "BAD-JE", "is_manual": "YES"},
+    ])
+    mapping = classify_columns(list(df.columns))["matched_columns"]
+    findings = audit_general_ledger(df, mapping)
+
+    assert not rule_codes(findings[0])
+    assert not rule_codes(findings[1])
+    assert rule_codes(findings[2]) == {"GL-003"}
+    assert {"GL-001", "GL-002"}.issubset(rule_codes(findings[3]))
+
+
+def test_chronic_paid_lateness_and_asset_variance_are_visible():
+    aging = pd.DataFrame([
+        {"due_date": "2025-01-01", "payment_date": "2025-04-15", "amount": 1000, "customer": "Late Co", "status": "Paid"},
+        {"due_date": "2025-02-01", "payment_date": "2025-05-15", "amount": 1000, "customer": "Late Co", "status": "Paid"},
+        {"due_date": "2025-03-01", "payment_date": "2025-06-15", "amount": 1000, "customer": "Late Co", "status": "Paid"},
+    ])
+    mapping = classify_columns(list(aging.columns))["matched_columns"]
+    findings = audit_aging(aging, mapping, as_of_date="2026-01-01")
+    assert all("AGE-004" in rule_codes(item) for item in findings)
+    assert all("AGE-001" not in rule_codes(item) for item in findings)
+
+    assets = pd.DataFrame([{"asset_name": "FA-051", "purchase_date": "2025-04-01", "purchase_cost": 600000, "depreciation_method": "SLM", "useful_life": 5, "current_value": 510000}])
+    asset_map = classify_columns(list(assets.columns))["matched_columns"]
+    assert "AST-003" in rule_codes(audit_fixed_assets(assets, asset_map, as_of_date="2026-08-22")[0])
 
 
 def test_master_report_counts_findings_and_discloses_methodology():

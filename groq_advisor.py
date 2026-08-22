@@ -24,9 +24,9 @@ EMERGENCY_FALLBACK_MODEL = "openai/gpt-oss-120b"
 MODEL_NAME = DRAFTER_MODEL
 
 KNOWN_RULE_CODES = {
-    "TXN-001", "TXN-002", "TXN-003", "TXN-004",
-    "AGE-001", "AGE-002", "AGE-003",
-    "GL-001", "GL-002",
+    "TXN-001", "TXN-002", "TXN-003", "TXN-004", "TXN-005", "TXN-006", "TXN-007", "TXN-008",
+    "AGE-001", "AGE-002", "AGE-003", "AGE-004",
+    "GL-001", "GL-002", "GL-003", "GL-004",
     "AST-001", "AST-002", "AST-003",
 }
 
@@ -173,8 +173,23 @@ def _build_domain_payload(all_domain_data: dict):
                     "description": flag.get("description", ""),
                     "detected_value": detected_value,
                     "remediation": flag.get("remediation", "Review supporting documentation."),
+                    "source_file": file_name,
                 })
-    return summary_stats, by_domain
+
+    # One summary row per domain prevents duplicate domain lines and double-counted
+    # file fragments while retaining source-file provenance in the register.
+    aggregated = {}
+    for stat in summary_stats:
+        domain = stat["domain"]
+        target = aggregated.setdefault(domain, {
+            "domain": domain, "rows": 0, "flagged_rows": 0, "findings": 0,
+            "audit_as_of_date": stat.get("audit_as_of_date"), "files": [],
+        })
+        target["rows"] += stat["rows"]
+        target["flagged_rows"] += stat["flagged_rows"]
+        target["findings"] += stat["findings"]
+        target["files"].append(stat["file"])
+    return list(aggregated.values()), by_domain
 
 def _render_section_1(summary_stats: list) -> str:
     total_files = len(summary_stats)
@@ -194,7 +209,9 @@ def _render_section_1(summary_stats: list) -> str:
         f"- **Audit As-Of / Benchmark Date:** {benchmark}",
         "- **Counting Basis:** A flagged row is counted once; individual findings count every rule triggered on that row.",
         "- **Aging Method:** AGE-001 applies only to open/unpaid invoices more than 90 days past due. AGE-003 counts only open, past-due invoices by counterparty.",
-        "- **Depreciation Method:** AST-003 uses the uploaded recognized method, a 365.25-day year, and flags positive book-value variance above 15% of cost after at least one year.",
+        "- **Depreciation Method:** AST-003 uses the uploaded recognized method, a 365.25-day year, and flags positive book-value variance above 10% of cost after at least one year.",
+        "- **Control Coverage:** Transactions include approval, round-number, structuring/split, three-way-match, duplicate-payment, negative-amount, and currency checks. GL includes supported voucher balancing, weekend manual entries, missing references, and period-end manual postings. Aging includes open overdue and chronic paid-late patterns.",
+        "- **Zero-Hit Interpretation:** A documented rule absent from the register was evaluated but produced no findings for the uploaded data.",
         "",
         "| Domain | Rows | Flagged Rows | Individual Findings |",
         "|--------|------|--------------|---------------------|"
@@ -215,12 +232,12 @@ def _render_section_2_domain(domain: str, findings: list) -> str:
     lines = [
         f"### {display_name}",
         "",
-        "| Row | Rule | Severity | Finding | Detected Value | Remediation |",
-        "|-----|------|----------|---------|-----------------|-------------|"
+        "| Source | Row | Rule | Severity | Finding | Detected Value | Remediation |",
+        "|--------|-----|------|----------|---------|----------------|-------------|"
     ]
     for f in findings:
         lines.append(
-            f"| {f['row_index']} | {f['rule_code']} | {f['severity']} "
+            f"| {_escape_md(f.get('source_file', ''))} | {f['row_index']} | {f['rule_code']} | {f['severity']} "
             f"| {_escape_md(f['description'])} | {_escape_md(f['detected_value'])} "
             f"| {_escape_md(f['remediation'])} |"
         )

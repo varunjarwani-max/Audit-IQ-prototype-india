@@ -20,7 +20,12 @@ ALIAS_DEFINITIONS = {
             "vendor": ["vendor", "supplier", "payee", "merchant", "vendor_name", "counterparty", "contractor", "seller"],
             "account_code": ["account_code", "account_no", "gl_code", "expense_code", "cost_code", "code_ref", "chart_of_accounts"],
             "approved_by": ["approved_by", "approver", "authorized_by", "signer", "approved", "approval_user", "manager", "auth_user"],
-            "department": ["department", "dept", "cost_center", "division", "business_unit", "team", "branch"]
+            "department": ["department", "dept", "cost_center", "division", "business_unit", "team", "branch"],
+            "account_code": ["account_code", "account_no", "gl_code", "expense_code", "cost_code", "code_ref"],
+            "currency": ["currency", "currency_code", "curr", "iso_currency"],
+            "transaction_id": ["transaction_id", "txn_id", "payment_id", "reference_id", "id"],
+            "three_way_match_status": ["three_way_match_status", "three_way_match", "match_status", "po_match_status"],
+            "duplicate_payment_candidate": ["duplicate_payment_candidate", "duplicate_candidate", "duplicate_payment", "is_duplicate"]
         }
     },
     "ar_ap_aging": {
@@ -48,7 +53,8 @@ ALIAS_DEFINITIONS = {
             "debit": ["debit", "dr", "debit_amount", "dr_amount", "debits"],
             "credit": ["credit", "cr", "credit_amount", "cr_amount", "credits"],
             "voucher_id": ["journal_reference", "je_number", "ref_number", "journal_id", "batch_id", "voucher_no", "reference", "journal_ref"],
-            "prepared_by": ["prepared_by", "created_by", "entered_by", "posted_by", "user_id", "author", "originator"]
+            "prepared_by": ["prepared_by", "created_by", "entered_by", "posted_by", "user_id", "author", "originator"],
+            "is_manual": ["is_manual", "manual_entry", "manual", "entry_type", "journal_type"]
         }
     },
     "fixed_assets": {

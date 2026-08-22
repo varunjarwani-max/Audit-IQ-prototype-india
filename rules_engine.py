@@ -40,12 +40,18 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
     amt_col = col_map.get("amount", "amount") if col_map else "amount"
     vendor_col = col_map.get("vendor", "vendor") if col_map else "vendor"
     appr_col = col_map.get("approved_by", "approved_by") if col_map else "approved_by"
+    account_col = col_map.get("account_code", "account_code") if col_map else "account_code"
+    currency_col = col_map.get("currency", "currency") if col_map else "currency"
+    match_col = col_map.get("three_way_match_status", "three_way_match_status") if col_map else "three_way_match_status"
+    duplicate_col = col_map.get("duplicate_payment_candidate", "duplicate_payment_candidate") if col_map else "duplicate_payment_candidate"
 
     # Use a unique positional index for internal calculations so uploaded files
     # with duplicate labels cannot break rolling-window assignment.
     df_clean = df.copy().reset_index(drop=True)
     if date_col in df_clean.columns:
         df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
+    if amt_col in df_clean.columns:
+        df_clean[amt_col] = df_clean[amt_col].map(_safe_number)
 
     # Vectorized calculation for TXN-004 (7-Day Split Invoicing)
     df_clean['rolling_sum'] = 0.0
@@ -65,9 +71,12 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
     for idx, row in df_clean.iterrows():
         row_index = idx + 1
         flags = []
-        amt = float(row[amt_col]) if pd.notnull(row.get(amt_col)) else 0.0
-        vendor = str(row.get(vendor_col, "Unknown Vendor"))
-        appr = str(row.get(appr_col, "")).strip()
+        amt = _safe_number(row.get(amt_col))
+        vendor = str(row.get(vendor_col, "Unknown Vendor")).strip()
+        appr = "" if pd.isna(row.get(appr_col)) else str(row.get(appr_col)).strip()
+        match_status = _normalized_text(row.get(match_col, ""))
+        duplicate_status = _normalized_text(row.get(duplicate_col, ""))
+        currency = "" if pd.isna(row.get(currency_col)) else str(row.get(currency_col)).strip().upper()
 
         # TXN-001: Missing approval
         if not appr or appr.lower() in ["nan", "none", "null", "''", ""]:
@@ -78,6 +87,34 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
                 "amount": amt,
                 "description": f"Transaction of {format_currency(amt)} lacks documented authorizing approval sign-off.",
                 "remediation": "Obtain signed physical or digital approval voucher before clearance."
+            })
+
+        if match_status and match_status not in {"matched", "match", "ok", "pass", "passed", "yes"}:
+            flags.append({
+                "rule_code": "TXN-005", "rule_name": "Three-Way Match Exception", "severity": "CRITICAL",
+                "amount": abs(amt), "description": f"Transaction for {format_currency(abs(amt))} has three-way match status '{row.get(match_col)}'.",
+                "remediation": "Reconcile purchase order, receipt, and supplier invoice before payment."
+            })
+
+        if duplicate_status in {"yes", "true", "1", "candidate", "duplicate", "flagged"}:
+            flags.append({
+                "rule_code": "TXN-006", "rule_name": "Duplicate Payment Candidate", "severity": "CRITICAL",
+                "amount": abs(amt), "description": f"Transaction for {format_currency(abs(amt))} is marked as a duplicate-payment candidate.",
+                "remediation": "Block settlement and compare invoice, vendor, amount, and payment references."
+            })
+
+        if amt < 0:
+            flags.append({
+                "rule_code": "TXN-007", "rule_name": "Negative Transaction Amount", "severity": "HIGH",
+                "amount": abs(amt), "description": f"Negative transaction amount of {format_currency(amt)} requires credit-note or reversal support.",
+                "remediation": "Verify the original entry, credit note, authorization, and reversal linkage."
+            })
+
+        if currency_col in df_clean.columns and not currency:
+            flags.append({
+                "rule_code": "TXN-008", "rule_name": "Missing Currency Code", "severity": "MEDIUM",
+                "amount": abs(amt), "description": "Transaction currency is blank, preventing reliable valuation and aggregation.",
+                "remediation": "Populate a valid ISO currency code and validate the applicable exchange rate."
             })
 
         # TXN-002: Exact round-number disbursement (Threshold enforced)
@@ -169,6 +206,13 @@ def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int
         valid_cp_mask = normalized_counterparties.ne("")
         cp_overdue_counts = normalized_counterparties[overdue_mask & valid_cp_mask].value_counts().to_dict()
 
+    cp_late_counts = {}
+    if due_col in df_clean.columns and pay_col in df_clean.columns and cp_col in df_clean.columns:
+        payment_lag = (df_clean[pay_col] - df_clean[due_col]).dt.days
+        late_mask = df_clean[pay_col].notna() & df_clean[due_col].notna() & (payment_lag >= 60)
+        normalized_counterparties = df_clean[cp_col].map(_normalized_text)
+        cp_late_counts = normalized_counterparties[late_mask & normalized_counterparties.ne("")].value_counts().to_dict()
+
     for idx, row in df_clean.iterrows():
         row_index = idx + 1
         flags = []
@@ -205,6 +249,15 @@ def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int
                 "remediation": "Investigate potential ghost invoice or premature fund disbursement."
             })
 
+        if pd.notnull(pay) and pd.notnull(due):
+            payment_lag_days = (pay - due).days
+            if cp_key and cp_late_counts.get(cp_key, 0) >= 3 and payment_lag_days >= 60:
+                flags.append({
+                    "rule_code": "AGE-004", "rule_name": "Chronic Late-Payment Pattern", "severity": "HIGH",
+                    "amount": amt, "description": f"Counterparty '{cp}' paid {cp_late_counts[cp_key]} invoices at least 60 days late; this invoice was {payment_lag_days} days late.",
+                    "remediation": "Reassess credit terms, limits, expected-credit-loss assumptions, and collection controls."
+                })
+
         # AGE-003: Chronic Delinquency
         if invoice_is_open and cp_key and cp_overdue_counts.get(cp_key, 0) >= 2 and overdue_days > 0:
             flags.append({
@@ -236,29 +289,45 @@ def audit_general_ledger(df: pd.DataFrame, col_map: dict = None, period_end_days
     cr_col = col_map.get("credit", "credit") if col_map else "credit"
     date_col = col_map.get("posting_date", "posting_date") if col_map else "posting_date"
     vouch_col = col_map.get("voucher_id", "voucher_id") if col_map else "voucher_id"
+    manual_col = col_map.get("is_manual", "is_manual") if col_map else "is_manual"
 
-    df_clean = df.copy()
+    df_clean = df.copy().reset_index(drop=True)
     if date_col in df_clean.columns:
         df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
+    for col in [dr_col, cr_col]:
+        if col in df_clean.columns:
+            df_clean[col] = df_clean[col].map(_safe_number)
 
     voucher_balances = {}
+    voucher_counts = {}
     if vouch_col in df_clean.columns:
-        grouped = df_clean.groupby(vouch_col)
+        valid_refs = df_clean[vouch_col].map(_normalized_text).ne("")
+        grouped = df_clean.loc[valid_refs].groupby(vouch_col, dropna=False)
         for v_id, group in grouped:
-            total_dr = group[dr_col].sum() if dr_col in group.columns else 0.0
-            total_cr = group[cr_col].sum() if cr_col in group.columns else 0.0
-            voucher_balances[v_id] = (total_dr, total_cr)
+            voucher_counts[str(v_id)] = len(group)
+            # Balance only multi-leg vouchers. A unique reference on a single-leg
+            # export is not evidence that the underlying journal is unbalanced.
+            if len(group) >= 2:
+                total_dr = group[dr_col].sum() if dr_col in group.columns else 0.0
+                total_cr = group[cr_col].sum() if cr_col in group.columns else 0.0
+                voucher_balances[str(v_id)] = (total_dr, total_cr)
 
     for idx, row in df_clean.iterrows():
         row_index = idx + 1
         flags = []
-        dr = float(row[dr_col]) if dr_col in row and pd.notnull(row[dr_col]) else 0.0
-        cr = float(row[cr_col]) if cr_col in row and pd.notnull(row[cr_col]) else 0.0
-        v_id = str(row.get(vouch_col, f"VOUCH-{row_index}"))
-        p_date = row.get(date_col)
+        dr = _safe_number(row.get(dr_col))
+        cr = _safe_number(row.get(cr_col))
+        raw_v_id = row.get(vouch_col, "")
+        v_id = "" if pd.isna(raw_v_id) else str(raw_v_id).strip()
+        p_date = row.get(date_col) if date_col in df_clean.columns else pd.NaT
+        manual_value = _normalized_text(row.get(manual_col, ""))
+        is_manual = manual_value in {"yes", "true", "1", "manual", "y"}
 
-        if v_id in voucher_balances:
-            tot_dr, tot_cr = voucher_balances[v_id]
+        balance = voucher_balances.get(v_id)
+        if balance is None and dr != 0 and cr != 0:
+            balance = (dr, cr)
+        if balance is not None:
+            tot_dr, tot_cr = balance
             diff = abs(tot_dr - tot_cr)
             if diff > 0.01:
                 flags.append({
@@ -272,16 +341,30 @@ def audit_general_ledger(df: pd.DataFrame, col_map: dict = None, period_end_days
                     "remediation": "Reconcile offsetting credit/debit leg before posting to master ledger."
                 })
 
-        if pd.notnull(p_date) and p_date.weekday() in [5, 6]:
+        if pd.notnull(p_date) and p_date.weekday() in [5, 6] and is_manual:
             day_name = p_date.strftime("%A")
             date_str = p_date.strftime("%Y-%m-%d")
             flags.append({
                 "rule_code": "GL-002",
                 "rule_name": "Weekend Manual Journal Entry",
                 "severity": "HIGH",
-                "amount": max(dr, cr),
-                "description": f"Manual journal adjustment posted on {day_name} ({date_str}) outside business authorization hours.",
-                "remediation": "Verify management sign-off and server authentication logs for emergency weekend entry."
+                "amount": max(abs(dr), abs(cr)),
+                "description": f"Entry marked manual was posted on {day_name} ({date_str}) outside normal business days.",
+                "remediation": "Verify management sign-off and server authentication logs for the weekend entry."
+            })
+
+        if vouch_col in df_clean.columns and not v_id:
+            flags.append({
+                "rule_code": "GL-003", "rule_name": "Missing Journal Reference", "severity": "HIGH",
+                "amount": max(abs(dr), abs(cr)), "description": "Ledger entry has no journal reference and cannot be traced to a complete voucher.",
+                "remediation": "Assign a unique source reference and reconcile the entry to supporting documentation."
+            })
+
+        if is_manual and pd.notnull(p_date) and p_date.day >= 25:
+            flags.append({
+                "rule_code": "GL-004", "rule_name": "Period-End Manual Posting", "severity": "MEDIUM",
+                "amount": max(abs(dr), abs(cr)), "description": f"Manual entry was posted near period end on {p_date.strftime('%Y-%m-%d')}.",
+                "remediation": "Inspect period-end support, approval, cutoff, and any subsequent reversal."
             })
 
         results.append({
@@ -378,7 +461,7 @@ def audit_fixed_assets(df: pd.DataFrame, col_map: dict = None, as_of_date: str =
 
             if expected_bv is not None and age_years >= 1.0:
                 variance = bv - expected_bv
-                if variance > (cost * 0.15):
+                if variance > (cost * 0.10):
                     flags.append({
                         "rule_code": "AST-003",
                         "rule_name": "Depreciation Curve Anomaly",
