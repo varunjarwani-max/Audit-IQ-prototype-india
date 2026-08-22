@@ -10,6 +10,22 @@ def format_currency(val: float) -> str:
     return f"₹{float(val):,.2f}"
 
 
+def _safe_number(value, default: float = 0.0) -> float:
+    """Parse uploaded numeric values without crashing on commas, symbols, or blanks."""
+    if pd.isna(value):
+        return default
+    if isinstance(value, str):
+        value = value.replace(",", "").replace("₹", "").replace("$", "").strip()
+    parsed = pd.to_numeric(value, errors="coerce")
+    return float(parsed) if pd.notna(parsed) else default
+
+
+def _normalized_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip().lower().replace("_", " ").replace("-", " ")
+
+
 def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: float = 50000.0) -> list:
     """
     Audits transactions dataset for:
@@ -122,37 +138,52 @@ def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int
     inv_col = col_map.get("invoice_date", "invoice_date") if col_map else "invoice_date"
     pay_col = col_map.get("payment_date", "payment_date") if col_map else "payment_date"
     cp_col = col_map.get("counterparty", "counterparty") if col_map else "counterparty"
+    status_col = col_map.get("invoice_status", "invoice_status") if col_map else "invoice_status"
 
-    df_clean = df.copy()
+    df_clean = df.copy().reset_index(drop=True)
     for col in [due_col, inv_col, pay_col]:
         if col in df_clean.columns:
             df_clean[col] = pd.to_datetime(df_clean[col], errors="coerce")
 
-    # Dynamic as_of_date resolution
-    if as_of_date:
-        ref_date = pd.to_datetime(as_of_date)
-    else:
-        max_date = df_clean[due_col].max() if due_col in df_clean.columns else pd.NaT
-        ref_date = max_date if pd.notna(max_date) else pd.to_datetime(datetime.today())
+    # A supplied benchmark is authoritative. Otherwise use today's date so aging
+    # is meaningful even when the file contains only old or future due dates.
+    parsed_ref_date = pd.to_datetime(as_of_date, errors="coerce") if as_of_date else pd.Timestamp.today()
+    ref_date = parsed_ref_date.normalize() if pd.notna(parsed_ref_date) else pd.Timestamp.today().normalize()
 
-    # Pre-calculate AGE-003: Only count OVERDUE invoices for delinquency
+    closed_statuses = {
+        "paid", "cleared", "settled", "closed", "complete", "completed",
+        "fully paid", "paid in full", "reconciled", "written off", "write off",
+    }
+
+    def is_open_invoice(row) -> bool:
+        payment_date = row.get(pay_col) if pay_col in df_clean.columns else pd.NaT
+        status = _normalized_text(row.get(status_col, "")) if status_col in df_clean.columns else ""
+        return pd.isna(payment_date) and status not in closed_statuses
+
+    # AGE-003 counts only currently open invoices whose due dates have passed.
     cp_overdue_counts = {}
     if due_col in df_clean.columns and cp_col in df_clean.columns:
-        overdue_mask = (ref_date - df_clean[due_col]).dt.days > 0
-        cp_overdue_counts = df_clean.loc[overdue_mask, cp_col].value_counts().to_dict()
+        open_mask = df_clean.apply(is_open_invoice, axis=1)
+        overdue_mask = open_mask & df_clean[due_col].notna() & (df_clean[due_col] < ref_date)
+        normalized_counterparties = df_clean[cp_col].map(_normalized_text)
+        valid_cp_mask = normalized_counterparties.ne("")
+        cp_overdue_counts = normalized_counterparties[overdue_mask & valid_cp_mask].value_counts().to_dict()
 
     for idx, row in df_clean.iterrows():
         row_index = idx + 1
         flags = []
-        amt = float(row[amt_col]) if pd.notnull(row.get(amt_col)) else 0.0
-        cp = str(row.get(cp_col, "Unknown Counterparty"))
-        due = row.get(due_col)
-        inv = row.get(inv_col)
-        pay = row.get(pay_col)
+        amt = _safe_number(row.get(amt_col))
+        cp_raw = row.get(cp_col, "Unknown Counterparty")
+        cp = str(cp_raw).strip() if pd.notna(cp_raw) and str(cp_raw).strip() else "Unknown Counterparty"
+        cp_key = _normalized_text(cp_raw)
+        due = row.get(due_col) if due_col in df_clean.columns else pd.NaT
+        inv = row.get(inv_col) if inv_col in df_clean.columns else pd.NaT
+        pay = row.get(pay_col) if pay_col in df_clean.columns else pd.NaT
+        invoice_is_open = is_open_invoice(row)
 
-        # AGE-001: Severe Overdue
-        overdue_days = (ref_date - due).days if pd.notnull(due) else 0
-        if overdue_days > severe_overdue_days:
+        # AGE-001: Severe Overdue applies only to unpaid/open invoices.
+        overdue_days = max(0, (ref_date - due).days) if pd.notnull(due) else 0
+        if invoice_is_open and overdue_days > severe_overdue_days:
             sev = "CRITICAL" if overdue_days > 300 or amt > 100000 else "HIGH"
             flags.append({
                 "rule_code": "AGE-001",
@@ -175,13 +206,13 @@ def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int
             })
 
         # AGE-003: Chronic Delinquency
-        if cp_overdue_counts.get(cp, 0) >= 2 and overdue_days > 0:
+        if invoice_is_open and cp_key and cp_overdue_counts.get(cp_key, 0) >= 2 and overdue_days > 0:
             flags.append({
                 "rule_code": "AGE-003",
                 "rule_name": "Chronic Counterparty Delinquency",
                 "severity": "HIGH",
                 "amount": amt,
-                "description": f"Counterparty '{cp}' has {cp_overdue_counts[cp]} active delinquent records across ledger.",
+                "description": f"Counterparty '{cp}' has {cp_overdue_counts[cp_key]} active delinquent records across ledger.",
                 "remediation": "Impose strict advance payment terms or suspend credit facility."
             })
 
@@ -277,24 +308,35 @@ def audit_fixed_assets(df: pd.DataFrame, col_map: dict = None, as_of_date: str =
     date_col = col_map.get("purchase_date", "purchase_date") if col_map else "purchase_date"
     life_col = col_map.get("useful_life", "useful_life") if col_map else "useful_life"
     
-    df_clean = df.copy()
+    df_clean = df.copy().reset_index(drop=True)
     if date_col in df_clean.columns:
         df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
-        
-    ref_date = pd.to_datetime(as_of_date) if as_of_date else pd.to_datetime(datetime.today())
+
+    parsed_ref_date = pd.to_datetime(as_of_date, errors="coerce") if as_of_date else pd.Timestamp.today()
+    ref_date = parsed_ref_date.normalize() if pd.notna(parsed_ref_date) else pd.Timestamp.today().normalize()
+    undefined_methods = {"", "nan", "none", "null", "n/a", "na", "not applicable", "undefined"}
+    straight_line_methods = {"straight line", "straightline", "slm", "straight line method"}
+    declining_methods = {
+        "wdv", "written down value", "diminishing balance", "declining balance",
+        "double declining balance", "reducing balance",
+    }
+    no_depreciation_methods = {"land", "non depreciable", "not depreciated"}
 
     for idx, row in df_clean.iterrows():
         row_index = idx + 1
         flags = []
-        cost = float(row[cost_col]) if cost_col in row and pd.notnull(row[cost_col]) else 0.0
-        bv = float(row[bv_col]) if bv_col in row and pd.notnull(row[bv_col]) else 0.0
-        method = str(row.get(method_col, "")).strip()
-        asset_name = str(row.get(asset_col, f"Asset #{row_index}"))
-        p_date = row.get(date_col)
-        life = float(row[life_col]) if life_col in row and pd.notnull(row[life_col]) else 0.0
+        cost = _safe_number(row.get(cost_col))
+        bv = _safe_number(row.get(bv_col))
+        method_raw = row.get(method_col, "")
+        method = _normalized_text(method_raw)
+        asset_raw = row.get(asset_col, f"Asset #{row_index}")
+        asset_name = str(asset_raw).strip() if pd.notna(asset_raw) and str(asset_raw).strip() else f"Asset #{row_index}"
+        p_date = row.get(date_col) if date_col in df_clean.columns else pd.NaT
+        life = _safe_number(row.get(life_col))
+        method_is_defined = method not in undefined_methods
 
         # AST-001: Undefined depreciation
-        if not method or method.lower() in ["nan", "none", "null", "''", ""]:
+        if not method_is_defined:
             flags.append({
                 "rule_code": "AST-001",
                 "rule_name": "Undefined Depreciation Policy",
@@ -317,19 +359,33 @@ def audit_fixed_assets(df: pd.DataFrame, col_map: dict = None, as_of_date: str =
                 "remediation": "Inspect asset ledger for unauthorized write-ups or misallocated additions."
             })
 
-        # AST-003: Depreciation Curve Deviation
-        if pd.notnull(p_date) and cost > 0 and life > 0:
-            age_years = (ref_date - p_date).days / 365.25
-            if age_years >= 1.0:
-                expected_bv = max(0.0, cost - (cost / life * age_years))
-                if (bv - expected_bv) > (cost * 0.15):
+        # AST-003: Compare only recognized methods with their matching curve.
+        # Unknown-but-present methods are not silently treated as straight-line.
+        if method_is_defined and method not in no_depreciation_methods and pd.notnull(p_date) and cost > 0 and life > 0:
+            age_years = max(0.0, (ref_date - p_date).days / 365.25)
+            expected_bv = None
+            curve_name = None
+
+            if method in straight_line_methods:
+                expected_bv = max(0.0, cost - (cost / life * min(age_years, life)))
+                curve_name = "straight-line"
+            elif method in declining_methods:
+                # Without an uploaded depreciation rate, useful life supplies a
+                # conservative declining-balance rate rather than assuming SLM.
+                annual_rate = min(1.0, max(0.0, 1.0 / life))
+                expected_bv = max(0.0, cost * ((1.0 - annual_rate) ** age_years))
+                curve_name = "declining-balance"
+
+            if expected_bv is not None and age_years >= 1.0:
+                variance = bv - expected_bv
+                if variance > (cost * 0.15):
                     flags.append({
                         "rule_code": "AST-003",
                         "rule_name": "Depreciation Curve Anomaly",
                         "severity": "HIGH",
-                        "amount": bv - expected_bv,
-                        "description": f"Asset '{asset_name}' book value ({format_currency(bv)}) is highly inflated vs. expected straight-line depreciation ({format_currency(expected_bv)}).",
-                        "remediation": "Verify accumulated depreciation ledger and ensure consistent write-down procedures."
+                        "amount": variance,
+                        "description": f"Asset '{asset_name}' book value ({format_currency(bv)}) is materially above the expected {curve_name} value ({format_currency(expected_bv)}).",
+                        "remediation": "Verify accumulated depreciation, useful life, residual value, and posting completeness."
                     })
 
         results.append({

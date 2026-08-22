@@ -31,10 +31,10 @@ ALIAS_DEFINITIONS = {
         "aliases": {
             "invoice_date": ["invoice_date", "inv_date", "bill_date", "doc_date", "issue_date", "origination_date"],
             "due_date": ["due_date", "maturity_date", "payment_due", "due", "expiry_date", "expected_date"],
-            "payment_date": ["payment_date", "paid_date", "settlement_date", "cleared_date", "remittance_date", "paid_on"],
-            "amount": ["amount", "invoice_amount", "balance", "outstanding_amount", "open_amount", "total_billed", "net_due"],
-            "counterparty": ["customer_vendor", "customer", "vendor", "client", "customer_name", "vendor_name", "debtor", "creditor", "counterparty", "payer"],
-            "invoice_status": ["invoice_status", "status", "payment_status", "aging_status", "state", "inv_status"]
+            "payment_date": ["payment_date", "paid_date", "settlement_date", "cleared_date", "remittance_date", "paid_on", "date_paid", "date_settled", "receipt_date"],
+            "amount": ["amount", "invoice_amount", "balance", "outstanding_amount", "open_amount", "total_billed", "net_due", "amount_due", "invoice_total", "gross_amount"],
+            "counterparty": ["customer_vendor", "customer", "vendor", "client", "customer_name", "vendor_name", "debtor", "creditor", "counterparty", "payer", "party_name", "account_name"],
+            "invoice_status": ["invoice_status", "status", "payment_status", "aging_status", "state", "inv_status", "settlement_status", "paid_status", "document_status"]
         }
     },
     "general_ledger": {
@@ -60,9 +60,9 @@ ALIAS_DEFINITIONS = {
             "asset_name": ["asset_name", "asset_description", "equipment_name", "asset_title", "item_name", "asset"],
             "purchase_date": ["purchase_date", "acquisition_date", "capitalization_date", "placed_in_service", "buy_date", "in_service_date"],
             "cost": ["purchase_cost", "original_cost", "historical_cost", "acquisition_cost", "asset_cost", "gross_book_value", "cost"],
-            "method": ["depreciation_method", "depr_method", "depr_type", "method", "depreciation_type"],
-            "useful_life": ["useful_life", "lifespan", "useful_life_years", "life_years", "est_life", "asset_life"],
-            "book_value": ["current_value", "book_value", "net_book_value", "nbv", "carrying_value", "present_value"]
+            "method": ["depreciation_method", "depr_method", "depr_type", "method", "depreciation_type", "depreciation_basis", "depreciation_policy"],
+            "useful_life": ["useful_life", "lifespan", "useful_life_years", "life_years", "est_life", "asset_life", "estimated_useful_life", "life_in_years"],
+            "book_value": ["current_value", "book_value", "net_book_value", "nbv", "carrying_value", "present_value", "closing_book_value", "written_down_value"]
         }
     }
 }
