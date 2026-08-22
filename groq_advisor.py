@@ -14,7 +14,14 @@ try:
 except ImportError:  # Allows the helper module to run outside Streamlit.
     st = None
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+# Model routing is explicit so deterministic audit stages never spend LLM calls.
+CLASSIFIER_MODEL = "openai/gpt-oss-safeguard-20b"
+DRAFTER_MODEL = "openai/gpt-oss-20b"
+CHECKER_MODEL = "openai/gpt-oss-20b"
+EMERGENCY_FALLBACK_MODEL = "openai/gpt-oss-120b"
+
+# Backwards-compatible alias for callers that imported the old constant.
+MODEL_NAME = DRAFTER_MODEL
 
 KNOWN_RULE_CODES = {
     "TXN-001", "TXN-002", "TXN-003", "TXN-004",
@@ -70,15 +77,21 @@ def get_groq_client():
 def format_currency(val: float) -> str:
     return f"₹{float(val):,.2f}"
 
-def _call_groq_with_backoff(client, messages: list, max_retries: int = 4, temperature: float = 0.1):
+def _call_groq_with_backoff(
+    client,
+    messages: list,
+    model: str = DRAFTER_MODEL,
+    max_retries: int = 4,
+    temperature: float = 0.1,
+):
     base_delay = 1.0
     for attempt in range(max_retries + 1):
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
+                model=model,
                 messages=messages,
                 max_tokens=1024,
-                temperature=temperature
+                temperature=temperature,
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -88,6 +101,16 @@ def _call_groq_with_backoff(client, messages: list, max_retries: int = 4, temper
                 time.sleep(sleep_time)
             else:
                 raise
+
+
+def _call_with_emergency_fallback(client, messages: list, model: str = DRAFTER_MODEL, temperature: float = 0.1):
+    """Use the requested model first; reserve 120b for an actual model failure."""
+    try:
+        return _call_groq_with_backoff(client, messages, model=model, temperature=temperature)
+    except Exception:
+        return _call_groq_with_backoff(
+            client, messages, model=EMERGENCY_FALLBACK_MODEL, temperature=temperature
+        )
 
 def _check_hallucinations(text: str) -> list:
     problems = []
@@ -220,7 +243,9 @@ Strict rules:
     text = ""
     attempt = 0
     while attempt <= max_retries:
-        text = _call_groq_with_backoff(client, [{"role": "user", "content": prompt}], temperature=0.1)
+        text = _call_with_emergency_fallback(
+            client, [{"role": "user", "content": prompt}], model=CHECKER_MODEL, temperature=0.1
+        )
         issues = _check_hallucinations(text)
         if not issues:
             return text, []
@@ -250,7 +275,9 @@ def generate_consolidated_master_report(all_domain_data: dict, max_retries: int 
 def generate_executive_memo(domain_name: str, findings: list):
     client = get_groq_client()
     prompt = f"Provide a executive summary for domain '{domain_name}' with findings: {json.dumps(findings)}"
-    return _call_groq_with_backoff(client, [{"role": "user", "content": prompt}], temperature=0.2)
+    return _call_with_emergency_fallback(
+        client, [{"role": "user", "content": prompt}], model=DRAFTER_MODEL, temperature=0.2
+    )
 
 def generate_5c_finding_memo(record_data: dict, domain_name: str, max_retries: int = 2):
     client = get_groq_client()
@@ -261,7 +288,9 @@ Strict rules:
     
     attempt = 0
     while attempt <= max_retries:
-        text = _call_groq_with_backoff(client, [{"role": "user", "content": prompt}], temperature=0.2)
+        text = _call_with_emergency_fallback(
+            client, [{"role": "user", "content": prompt}], model=DRAFTER_MODEL, temperature=0.2
+        )
         issues = _check_hallucinations(text)
         if not issues:
             return text
