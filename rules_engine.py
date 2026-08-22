@@ -31,16 +31,19 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
     if date_col in df_clean.columns:
         df_clean[date_col] = pd.to_datetime(df_clean[date_col], errors="coerce")
 
-    # Vectorized calculation for TXN-004 (7-Day Split Invoicing)
+    # Vectorized calculation for TXN-004 (7-Day Split Invoicing).
+    # Assign each vendor's rolling results by its original row positions instead
+    # of by the date index returned by pandas. This avoids duplicate-label
+    # reindexing errors when transactions share a date or source index.
     df_clean['rolling_sum'] = 0.0
     df_clean['rolling_count'] = 0
     if date_col in df_clean.columns and amt_col in df_clean.columns and vendor_col in df_clean.columns:
+        df_clean[amt_col] = pd.to_numeric(df_clean[amt_col], errors="coerce")
         df_sorted = df_clean.dropna(subset=[date_col]).sort_values(by=[vendor_col, date_col])
-        if not df_sorted.empty:
-            rolling_sums = df_sorted.groupby(vendor_col).rolling('7D', on=date_col)[amt_col].sum().reset_index(level=0, drop=True)
-            rolling_counts = df_sorted.groupby(vendor_col).rolling('7D', on=date_col)[amt_col].count().reset_index(level=0, drop=True)
-            df_clean.loc[df_sorted.index, 'rolling_sum'] = rolling_sums
-            df_clean.loc[df_sorted.index, 'rolling_count'] = rolling_counts
+        for _, vendor_rows in df_sorted.groupby(vendor_col, sort=False, dropna=False):
+            rolling = vendor_rows.rolling('7D', on=date_col)[amt_col]
+            df_clean.loc[vendor_rows.index, 'rolling_sum'] = rolling.sum().to_numpy()
+            df_clean.loc[vendor_rows.index, 'rolling_count'] = rolling.count().to_numpy()
 
     for idx, row in df_clean.iterrows():
         row_index = idx + 1
