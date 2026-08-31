@@ -171,9 +171,26 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
         scores[cat] = score
         mappings[cat] = matched_fields
 
-    best_category = max(scores, key=scores.get)
+    ranked_categories = sorted(scores, key=scores.get, reverse=True)
+    best_category = ranked_categories[0]
+    runner_up_confidence = scores[ranked_categories[1]] if len(ranked_categories) > 1 else 0
     best_confidence = scores[best_category]
-    is_ambiguous = best_confidence < 50.0
+    score_margin = best_confidence - runner_up_confidence
+    matched_primary = set(mappings.get(best_category, {}))
+    required_evidence = {
+        "transactions": {"date", "amount"},
+        "ar_ap_aging": {"due_date", "amount"},
+        "general_ledger": {"posting_date", "debit", "credit"},
+        "fixed_assets": {"asset_name", "cost"},
+    }
+    minimum_evidence_met = required_evidence[best_category].issubset(matched_primary)
+    is_ambiguous = best_confidence < 50.0 or score_margin < 10 or not minimum_evidence_met
+    warnings = []
+    if not minimum_evidence_met:
+        missing = sorted(required_evidence[best_category] - matched_primary)
+        warnings.append(f"Missing required field evidence for {best_category}: {', '.join(missing)}.")
+    if score_margin < 10:
+        warnings.append("The top schema scores are too close for safe automatic routing.")
 
     return {
         "category": "ambiguous" if is_ambiguous else best_category,
@@ -182,5 +199,7 @@ def classify_columns(columns: List[str]) -> Dict[str, Any]:
         "is_ambiguous": is_ambiguous,
         "matched_columns": mappings.get(best_category, {}),
         "all_scores": scores,
+        "score_margin": score_margin,
+        "classification_warnings": warnings,
         "schema_details": ALIAS_DEFINITIONS.get(best_category, {})
     }

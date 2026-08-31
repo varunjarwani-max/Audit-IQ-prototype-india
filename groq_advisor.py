@@ -72,7 +72,11 @@ def get_groq_client():
             "No Groq API key was found. Add GROQ_API_KEY_1 through "
             "GROQ_API_KEY_4 to Streamlit secrets."
         )
-    return Groq(api_key=random.choice(api_keys))
+    return Groq(api_key=api_keys[0])
+
+
+def _get_groq_clients():
+    return [Groq(api_key=key) for key in _get_groq_api_keys()]
 
 def format_currency(val: float) -> str:
     return f"₹{float(val):,.2f}"
@@ -104,22 +108,38 @@ def _call_groq_with_backoff(
 
 
 def _call_with_emergency_fallback(client, messages: list, model: str = DRAFTER_MODEL, temperature: float = 0.1):
-    """Use the requested model first; reserve 120b for an actual model failure."""
-    try:
-        return _call_groq_with_backoff(client, messages, model=model, temperature=temperature)
-    except Exception:
-        return _call_groq_with_backoff(
-            client, messages, model=EMERGENCY_FALLBACK_MODEL, temperature=temperature
-        )
+    """Rotate configured keys before reserving 120b for an actual model failure."""
+    clients = [client] + _get_groq_clients()
+    last_error = None
+    for candidate in clients:
+        try:
+            return _call_groq_with_backoff(candidate, messages, model=model, temperature=temperature)
+        except Exception as exc:
+            last_error = exc
+    for candidate in clients:
+        try:
+            return _call_groq_with_backoff(candidate, messages, model=EMERGENCY_FALLBACK_MODEL, temperature=temperature)
+        except Exception as exc:
+            last_error = exc
+    raise last_error or RuntimeError("Groq request failed without an error response.")
 
 def _check_hallucinations(text: str) -> list:
     problems = []
-    if re.search(r'₹\d', text):
+    if re.search(r'(?:₹|\b(?:INR|Rs\.?|USD|EUR)\s*)[\d,]+(?:\.\d+)?', text, re.IGNORECASE):
         problems.append("Text contains a currency figure, which is not allowed.")
+    if re.search(r'\b\d+(?:\.\d+)?\s*%', text):
+        problems.append("Text contains an unsupported percentage.")
     mentioned_codes = set(re.findall(r'\b[A-Z]{2,4}-\d{3}\b', text))
     invented = mentioned_codes - KNOWN_RULE_CODES
     if invented:
         problems.append(f"Text references unknown rule code(s): {sorted(invented)}")
+    unsupported_certainty = re.findall(
+        r'\b(?:fraud(?:ulent)?|embezzlement|illegal|guilty|proven|confirmed fraud)\b',
+        text,
+        re.IGNORECASE,
+    )
+    if unsupported_certainty:
+        problems.append("Text makes an unsupported legal or fraud conclusion.")
     return problems
 
 def _build_domain_payload(all_domain_data: dict):

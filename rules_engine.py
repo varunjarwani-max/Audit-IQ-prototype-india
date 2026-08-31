@@ -5,6 +5,12 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+DEFAULT_TRANSACTION_THRESHOLD = 50000.0
+DEFAULT_SEVERE_OVERDUE_DAYS = 90
+DEFAULT_PERIOD_END_DAYS = 4
+DEFAULT_ASSET_VARIANCE_RATIO = 0.10
+
+
 def format_currency(val: float) -> str:
     """Utility helper to guarantee strict 2-decimal currency formatting."""
     return f"₹{float(val):,.2f}"
@@ -26,7 +32,7 @@ def _normalized_text(value) -> str:
     return str(value).strip().lower().replace("_", " ").replace("-", " ")
 
 
-def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: float = 50000.0) -> list:
+def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: float = DEFAULT_TRANSACTION_THRESHOLD) -> list:
     """
     Audits transactions dataset for:
     - TXN-001: Missing approval sign-off
@@ -170,7 +176,7 @@ def audit_transactions(df: pd.DataFrame, col_map: dict = None, threshold_limit: 
     return results
 
 
-def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int = 90, as_of_date: str = None) -> list:
+def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int = DEFAULT_SEVERE_OVERDUE_DAYS, as_of_date: str = None) -> list:
     """
     Audits AR/AP Aging dataset for:
     - AGE-001: Severe overdue invoice
@@ -286,7 +292,7 @@ def audit_aging(df: pd.DataFrame, col_map: dict = None, severe_overdue_days: int
     return results
 
 
-def audit_general_ledger(df: pd.DataFrame, col_map: dict = None, period_end_days: int = 4) -> list:
+def audit_general_ledger(df: pd.DataFrame, col_map: dict = None, period_end_days: int = DEFAULT_PERIOD_END_DAYS) -> list:
     """
     Audits General Ledger dataset for:
     - GL-001: Unbalanced journal voucher (Debit != Credit)
@@ -469,7 +475,7 @@ def audit_fixed_assets(df: pd.DataFrame, col_map: dict = None, as_of_date: str =
 
             if expected_bv is not None and age_years >= 1.0:
                 variance = bv - expected_bv
-                if variance > (cost * 0.10):
+                if variance > (cost * DEFAULT_ASSET_VARIANCE_RATIO):
                     flags.append({
                         "rule_code": "AST-003",
                         "rule_name": "Depreciation Curve Anomaly",

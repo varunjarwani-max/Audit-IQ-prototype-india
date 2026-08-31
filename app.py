@@ -16,6 +16,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+import hashlib
+import io
 import pandas as pd
 import numpy as np
 import time
@@ -23,7 +25,15 @@ from datetime import datetime
 
 # Local helper modules imported AFTER set_page_config
 from detector import classify_columns, ALIAS_DEFINITIONS
-from rules_engine import audit_transactions, audit_aging, audit_general_ledger, audit_fixed_assets
+from rules_engine import (
+    DEFAULT_PERIOD_END_DAYS,
+    DEFAULT_SEVERE_OVERDUE_DAYS,
+    DEFAULT_TRANSACTION_THRESHOLD,
+    audit_aging,
+    audit_fixed_assets,
+    audit_general_ledger,
+    audit_transactions,
+)
 from groq_advisor import generate_executive_memo, generate_5c_finding_memo, generate_consolidated_master_report
 from sample_data import SAMPLE_DATASETS
 
@@ -80,6 +90,26 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+
+
+def _uploaded_file_signature(uploaded_file) -> tuple[str, int, str]:
+    payload = uploaded_file.getvalue()
+    return uploaded_file.name, len(payload), hashlib.sha256(payload).hexdigest()
+
+
+def _parse_uploaded_file(uploaded_file) -> pd.DataFrame:
+    payload = uploaded_file.getvalue()
+    if not payload:
+        raise ValueError("The uploaded file is empty.")
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise ValueError("The uploaded file exceeds the 15 MB safety limit.")
+    stream = io.BytesIO(payload)
+    if uploaded_file.name.lower().endswith(".csv"):
+        return pd.read_csv(stream)
+    return pd.read_excel(stream)
+
+
 # ---------------------------------------------------------
 # Session State Initialization
 # ---------------------------------------------------------
@@ -101,10 +131,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### Global Settings")
-    # Transaction Anomaly Threshold slider removed -- no user-configurable cap.
-    # txn_threshold is fixed to "no limit" (infinity) so threshold-based checks
-    # (TXN-002/003/004) never impose an arbitrary ceiling by default.
-    txn_threshold = float("inf")
+    txn_threshold = DEFAULT_TRANSACTION_THRESHOLD
+    st.caption(f"Transaction approval benchmark: ₹{txn_threshold:,.0f}")
     as_of_date = st.date_input("Audit As-Of Date", value=datetime.today())
 
 # ---------------------------------------------------------
@@ -120,45 +148,58 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    new_names = {f.name for f in uploaded_files}
-    old_names = set(st.session_state["multi_file_data"].keys())
-    current_audit_config = (tuple(sorted(new_names)), as_of_date.isoformat(), txn_threshold)
+    signatures = tuple(sorted(_uploaded_file_signature(file) for file in uploaded_files))
+    current_audit_config = (signatures, as_of_date.isoformat(), txn_threshold)
 
-    # Re-run every date-sensitive rule when the benchmark changes, even when
-    # the user uploads files with the same names as the previous run.
-    if new_names != old_names or current_audit_config != st.session_state["audit_config"]:
-        st.session_state["multi_file_data"] = {}
+    if current_audit_config != st.session_state["audit_config"]:
+        processed_files = {}
+        rejected_files = []
         for file in uploaded_files:
-            file.seek(0)
-            df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
+            try:
+                df = _parse_uploaded_file(file)
+            except Exception as exc:
+                rejected_files.append(file.name)
+                st.error(f"`{file.name}` could not be parsed: {exc}")
+                continue
+
             classification = classify_columns(list(df.columns))
-            
-            if classification.get("classification_warnings"):
-                for w in classification["classification_warnings"]:
-                    st.warning(f"⚠️ `{file.name}`: {w}")
-            
+            for warning in classification.get("classification_warnings", []):
+                st.warning(f"`{file.name}`: {warning}")
+
             category = classification["category"]
-            if category == "ambiguous": category = classification["raw_best_category"]
-            
+            if category == "ambiguous":
+                rejected_files.append(file.name)
+                st.error(f"`{file.name}` was not audited because its schema could not be classified safely.")
+                continue
+
             col_map = classification["matched_columns"]
-            findings = []
-            
-            if category == "transactions": findings = audit_transactions(df, col_map, threshold_limit=txn_threshold)
-            elif category == "ar_ap_aging": findings = audit_aging(df, col_map, severe_overdue_days=90, as_of_date=as_of_date)
-            elif category == "general_ledger": findings = audit_general_ledger(df, col_map, period_end_days=4)
-            elif category == "fixed_assets": findings = audit_fixed_assets(df, col_map, as_of_date=as_of_date)
-            
-            st.session_state["multi_file_data"][file.name] = {
+            if category == "transactions":
+                findings = audit_transactions(df, col_map, threshold_limit=txn_threshold)
+            elif category == "ar_ap_aging":
+                findings = audit_aging(df, col_map, severe_overdue_days=DEFAULT_SEVERE_OVERDUE_DAYS, as_of_date=as_of_date)
+            elif category == "general_ledger":
+                findings = audit_general_ledger(df, col_map, period_end_days=DEFAULT_PERIOD_END_DAYS)
+            else:
+                findings = audit_fixed_assets(df, col_map, as_of_date=as_of_date)
+
+            processed_files[file.name] = {
                 "df": df,
                 "category": category,
                 "findings": findings,
                 "classification": classification,
                 "audit_as_of_date": as_of_date.isoformat(),
+                "content_signature": _uploaded_file_signature(file)[2],
             }
 
+        st.session_state["multi_file_data"] = processed_files
         st.session_state["audit_config"] = current_audit_config
-        st.session_state["active_file_name"] = uploaded_files[0].name
-        st.session_state["working_df"] = st.session_state["multi_file_data"][uploaded_files[0].name]["df"]
+        st.session_state["individual_memos"] = {}
+        if processed_files:
+            first_name = next(iter(processed_files))
+            st.session_state["active_file_name"] = first_name
+            st.session_state["working_df"] = processed_files[first_name]["df"].copy()
+        else:
+            st.session_state["active_file_name"] = None
         st.session_state["override_category"] = None
         st.session_state["custom_col_map"] = {}
         st.rerun()
@@ -274,7 +315,8 @@ if st.session_state["multi_file_data"]:
                     </div>
                     """, unsafe_allow_html=True)
                 
-                memo_key = f"memo_row_{global_row_num}"
+                active_signature = active_data.get("content_signature", "unspecified")
+                memo_key = f"{st.session_state['active_file_name']}:{active_signature}:row:{global_row_num}"
                 if memo_key in st.session_state["individual_memos"]:
                     st.markdown(st.session_state["individual_memos"][memo_key])
                 else:

@@ -1,12 +1,40 @@
 import pandas as pd
 
 from detector import classify_columns
-from groq_advisor import generate_consolidated_master_report
+from groq_advisor import _check_hallucinations, generate_consolidated_master_report
 from rules_engine import audit_aging, audit_fixed_assets, audit_general_ledger, audit_transactions
 
 
 def rule_codes(result):
     return {flag["rule_code"] for flag in result["flags"]}
+
+
+def test_classifier_rejects_unknown_and_close_schema_matches():
+    unknown = classify_columns(["foo", "bar", "notes"])
+    assert unknown["category"] == "ambiguous"
+    assert unknown["classification_warnings"]
+
+    incomplete = classify_columns(["date", "vendor", "approved_by"])
+    assert incomplete["category"] == "ambiguous"
+    assert any("missing required field" in warning.lower() for warning in incomplete["classification_warnings"])
+
+
+def test_transaction_default_threshold_flags_boundary_conditions():
+    df = pd.DataFrame([
+        {"date": "2026-01-01", "amount": 49999, "vendor": "A", "approved_by": "Manager"},
+        {"date": "2026-01-02", "amount": 50000, "vendor": "B", "approved_by": "Manager"},
+        {"date": "2026-01-03", "amount": 50001, "vendor": "C", "approved_by": "Manager"},
+    ])
+    findings = audit_transactions(df)
+    assert "TXN-002" not in rule_codes(findings[0])
+    assert "TXN-002" in rule_codes(findings[1])
+    assert "TXN-002" not in rule_codes(findings[2])
+
+
+def test_hallucination_guard_rejects_unsupported_claims():
+    assert _check_hallucinations("Loss was INR 10,000 and affected 25% of entries.")
+    assert _check_hallucinations("This proves fraudulent embezzlement under NEW-999.")
+    assert not _check_hallucinations("The exception requires professional review under GL-002.")
 
 
 def test_paid_invoices_are_not_overdue_or_chronic():
